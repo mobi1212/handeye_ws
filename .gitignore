@@ -1,0 +1,17 @@
+build/
+devel/
+install/
+logs/
+build_isolated/
+devel_isolated/
+.catkin_tools/
+.colcon/
+.vscode/
+.idea/
+.ccls-cache/
+*.pyc
+*.pyo
+*.swp
+*.swo
+.DS_Store
+*.bag
