@@ -15,3 +15,9 @@ devel_isolated/
 *.swo
 .DS_Store
 *.bag
+
+# ML weights & runs
+*.pt
+*.onnx
+runs/
+

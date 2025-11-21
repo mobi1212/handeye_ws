@@ -1,0 +1,31 @@
+<launch>
+  <!-- 基本參數（可在命令列覆蓋） -->
+  <arg name="base_frame"      default="base_link"/>
+  <arg name="cam_frame"       default="camera_color_optical_frame"/>
+  <arg name="move_group"      default="manipulator"/>
+  <arg name="ee_link"         default="tool0_controller"/>
+  <arg name="approach_z"      default="0.15"/>   <!-- m，初測保守 -->
+  <arg name="hover_z"         default="0.03"/>   <!-- m -->
+  <arg name="max_vel_scaling" default="0.2"/>
+  <arg name="max_acc_scaling" default="0.2"/>
+  <arg name="color_topic"     default="/camera/color/image_raw"/>
+  <arg name="depth_topic"     default="/camera/aligned_depth_to_color/image_raw"/>
+  <arg name="cinfo_topic"     default="/camera/color/camera_info"/>
+
+  <node pkg="ur3_click2pick" type="click_to_pick_cv.py" name="click_to_pick_cv" output="screen">
+    <param name="base_frame"          value="$(arg base_frame)"/>
+    <param name="cam_frame"           value="$(arg cam_frame)"/>
+    <param name="move_group"          value="$(arg move_group)"/>
+    <param name="ee_link"             value="$(arg ee_link)"/>
+    <param name="approach_z"          value="$(arg approach_z)"/>
+    <param name="hover_z"             value="$(arg hover_z)"/>
+    <param name="max_vel_scaling"     value="$(arg max_vel_scaling)"/>
+    <param name="max_acc_scaling"     value="$(arg max_acc_scaling)"/>
+    <param name="color_topic"         value="$(arg color_topic)"/>
+    <param name="depth_topic"         value="$(arg depth_topic)"/>
+    <param name="cinfo_topic"         value="$(arg cinfo_topic)"/>
+    <param name="pick_offset_z"  value="0.15" />
+    <param name="pick_pkg"       value="ur3_click2pick" />
+    <param name="pick_script"    value="pick_object.py" />
+  </node>
+</launch>
