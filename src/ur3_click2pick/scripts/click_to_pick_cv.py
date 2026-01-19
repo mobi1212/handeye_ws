@@ -300,12 +300,26 @@ class ClickToPickCV:
 def main():
     rospy.init_node("click_to_pick_cv")
     app = ClickToPickCV()
+
     rospy.loginfo("Ready. Click on the image; press 'q' to quit.")
+
+    rate = rospy.Rate(60)  # 60 FPS GUI loop
     while not rospy.is_shutdown():
-        if cv2.waitKey(10) & 0xFF == ord('q'):
+
+        if app.color is not None:
+            disp = app.color.copy()
+            cv2.putText(disp, "Click a pixel (approach -> descend -> grip -> lift)",
+                        (18,30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+            cv2.imshow(WIN, disp)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
             break
-        rospy.sleep(0.01)
+
+        rate.sleep()
+
     cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()

@@ -23,4 +23,9 @@
         <param name="calibration_file" value="$(arg calibration_file)" />
         <node name="$(anon handeye_publisher)" pkg="easy_handeye" type="publish.py" output="screen"/>
     </group>
+    <node
+        pkg="tf2_ros"
+        type="static_transform_publisher"
+        name="camera_optical_to_link_bridge"
+        args="0 0 0 0 0 0 camera_color_optical_frame camera_link" />
 </launch>
