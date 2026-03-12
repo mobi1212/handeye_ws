@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Pose-to-Pick (含 TCP offset 修正的版本)
+Pose-to-Pick (含 TCP offset 修正 + 手動姿態選擇版本)
 
 動作順序：
-  1) 物體位置 + 姿態 -> 算出 ee_z
-  2) 用 tcp_offset 修正出「法蘭應到達的 grasp_xyz」
-  3) 沿 -ee_z 方向拉出 pre-grasp
-  4) go(pre-grasp) 關節空間
-  5) Cartesian 從 pre-grasp 前進到 grasp
-  6) 夾緊
-  7) 統一往 base_link +Z 方向抬升（retreat up）
-  8) 移動到固定放置姿勢 final pose
-  9) 開夾
- 10) 再往上抬一小段（避免撞到物體）
+  1) 收到 YOLO 座標 -> 等待使用者輸入抓取姿態 (1/2/3)
+  2) 物體位置 + 姿態 -> 算出 ee_z
+  3) 用 tcp_offset 修正出「法蘭應到達的 grasp_xyz」
+  4) 沿 -ee_z 方向拉出 pre-grasp
+  5) go(pre-grasp) 關節空間
+  6) Cartesian 從 pre-grasp 前進到 grasp
+  7) 夾緊
+  8) 統一往 base_link +Z 方向抬升（retreat up）
+  9) 移動到固定放置姿勢 final pose
+ 10) 開夾
+ 11) 再往上抬一小段（避免撞到物體）
 
 ⚠️ 已加入：
   - 訂閱 /yolo/target_pixel (geometry_msgs/Point)
@@ -47,7 +48,8 @@ class PoseToPick:
         # 使用者輸入：物體位置 + 夾爪姿態（RPY, deg）
         # ⚠️ target_xyz 現在會被 YOLO + depth 自動覆蓋，但預設值仍保留
         self.target_xyz      = rospy.get_param("~target_xyz",      [0.4, 0.0, 0.15])
-        self.target_rpy_deg  = rospy.get_param("~target_rpy_deg",  [180.0, 0.0, 50.0])
+        # 預設姿態 (會被手動輸入覆蓋)
+        self.target_rpy_deg  = rospy.get_param("~target_rpy_deg",  [180.0, 0.0, 0.0])
 
         # 相機與深度相關參數
         self.cam_frame   = rospy.get_param("~cam_frame",  "camera_color_optical_frame")
@@ -63,14 +65,14 @@ class PoseToPick:
         self.fx = self.fy = self.cx = self.cy = None
 
         # TCP 偏移（夾爪指尖中心到 MoveIt end-effector 的距離, m）
-        self.tcp_offset = float(rospy.get_param("~tcp_offset", 0.152))
-
+        self.tcp_offset = float(rospy.get_param("~tcp_offset", 0.163))
+        self.grasp_depth = float(rospy.get_param("~grasp_depth", 0.03))#抓取深度：指尖要「刺入」物體表面多深 (單位: m)
         # pre-grasp 距離（沿 -ee_z 方向），retreat_dist 現在僅保留參數，不再使用
         self.approach_dist = float(rospy.get_param("~approach_dist", 0.1))  # m
         self.retreat_dist  = float(rospy.get_param("~retreat_dist",  0.10))  # m（未使用）
 
         # 統一往上抬升的高度（grasp 之後）
-        self.retreat_up_height    = float(rospy.get_param("~retreat_up_height", 0.20))  # m
+        self.retreat_up_height    = float(rospy.get_param("~retreat_up_height", 0.15))  # m
         # 放開之後再往上抬升一小段
         self.post_open_up_height  = float(rospy.get_param("~post_open_up_height", 0.1))  # m
 
@@ -79,7 +81,7 @@ class PoseToPick:
         self.acc_scale   = float(rospy.get_param("~acc_scale",  0.10))
 
         # 固定放置位置與姿態（final drop pose）
-        self.final_xyz     = [0.2, 0.1, 0.17]
+        self.final_xyz     = [0.2, 0.1, 0.165]
         self.final_rpy_deg = [180.0, 0.0, 0.0]
 
         # 夾爪 TCP
@@ -166,6 +168,29 @@ class PoseToPick:
 
         # 將 YOLO 點轉換結果當作「物體中心」，覆蓋 target_xyz
         self.target_xyz = [x, y, z]
+
+        # ----------------------------------------------------
+        # [NEW] 手動輸入選擇姿態
+        # ----------------------------------------------------
+        print("\n=== 請選擇抓取姿態 ===")
+        print("1: 垂直向下 (Pitch=0)")
+        print("2: 斜抓 30度 (Pitch=-30, 向前傾)")
+        print("3: 斜抓 60度 (Pitch=-60, 向前傾)")
+        user_input = input("請輸入 (1/2/3) 並按 Enter: ").strip()
+
+        if user_input == '1':
+            self.target_rpy_deg = [180.0, 0.0, 0.0]
+            rospy.loginfo("[p2p] 選擇姿態: 垂直向下")
+        elif user_input == '2':
+            self.target_rpy_deg = [180.0, -30.0, 0.0]
+            rospy.loginfo("[p2p] 選擇姿態: 斜抓 30度")
+        elif user_input == '3':
+            self.target_rpy_deg = [180.0, -60.0, 0.0]
+            rospy.loginfo("[p2p] 選擇姿態: 斜抓 60度")
+        else:
+            self.target_rpy_deg = [180.0, 0.0, 0.0] # 預設垂直
+            rospy.logwarn("[p2p] 輸入無效，預設使用垂直向下")
+        # ----------------------------------------------------
 
         # 直接執行原本的 Pose-to-Pick 管線
         self.run_once()
@@ -297,65 +322,37 @@ class PoseToPick:
 
     # ---------- main logic ----------
     def run_once(self):
-# ==========================================
-        # [桌面距離線性補償] Distance-based Linear Compensation
-        # ==========================================
-        # 依據現場實測數據 (更新於 2026-01-19)
-        # 僅針對 XY 軸進行線性補償，Z 軸補償設為 0
-        
-        # 1. 【數據點 A】 (對應 Y=0.428 的位置)
-        # 原始計算: (-0.197, 0.428) -> 正確: (-0.150, 0.402)
-        val_point_a = 0.428
-        offset_a    = [0.0467, -0.0255, 0.0]  # [dx, dy, dz]
-
-        # 2. 【數據點 B】 (對應 Y=0.095 的位置)
-        # 原始計算: (0.135, 0.095) -> 正確: (0.189, 0.052)
-        val_point_b = 0.095
-        offset_b    = [0.0546, -0.0422, 0.0]  # [dx, dy, dz]
-
-        # 取得當前物體的 Y 座標 (作為插值依據)
-        current_val = self.target_xyz[1]
-
-        # 計算插值權重 (Alpha)
-        # 公式說明：計算 current_val 在 Point B 和 Point A 之間的位置
-        # 若 current_val = 0.095 (Point B), alpha = 0
-        # 若 current_val = 0.428 (Point A), alpha = 1
-        denom = val_point_a - val_point_b
-        if abs(denom) < 1e-6:
-            alpha = 0
-        else:
-            alpha = (current_val - val_point_b) / denom
-
-        # 算出當下的動態補償值
-        dynamic_offset = [0.0, 0.0, 0.0]
-        for i in range(3):
-            # 線性插值公式: Offset = Offset_B + (Offset_A - Offset_B) * alpha
-            dynamic_offset[i] = offset_b[i] + (offset_a[i] - offset_b[i]) * alpha
-
-        rospy.loginfo(f"[Compensate] Y_raw={current_val:.3f}, Alpha={alpha:.3f}")
-        rospy.loginfo(f"[Compensate] Dynamic Offset: X={dynamic_offset[0]:.4f}, Y={dynamic_offset[1]:.4f}, Z={dynamic_offset[2]:.4f}")
-
-        # 套用補償
-        self.target_xyz[0] += dynamic_offset[0]
-        self.target_xyz[1] += dynamic_offset[1]
-        self.target_xyz[2] += dynamic_offset[2]
-        
-        rospy.loginfo(f"[Compensate] Final Target: ({self.target_xyz[0]:.3f}, {self.target_xyz[1]:.3f}, {self.target_xyz[2]:.3f})")
-        # ==========================================
-        # 1) 用物體位置 + 姿態先算出 ee_z 方向
+        # 1) 用物體位置 + 姿態先算出 ee_z 方向 (這是夾爪的指向)
         ps_tmp = self.make_pose_stamped_from_xyz_rpy(self.target_xyz, self.target_rpy_deg)
         ee_z = self.get_ee_z_axis_in_base(ps_tmp)
 
-        rospy.loginfo("[p2p] object_xyz = (%.3f, %.3f, %.3f)", *self.target_xyz)
-        rospy.loginfo("[p2p] ee_z in base = [%.3f, %.3f, %.3f]", ee_z[0], ee_z[1], ee_z[2])
+        rospy.loginfo("[p2p] object_surface = (%.3f, %.3f, %.3f)", *self.target_xyz)
+        
+        # ==========================================
+        # [NEW] 應用抓取深度 (Grasp Depth)
+        # ==========================================
+        # 原理：沿著夾爪指向 (ee_z) 繼續前進 grasp_depth 的距離
+        # 這樣可以確保指尖包覆物體，而不只是摸到表面
+        
+        real_target_xyz = np.array(self.target_xyz) + (ee_z * self.grasp_depth)
+        
+        # 安全檢查 (撞桌保護)：
+        # 如果深入後 Z 值太低 (例如小於桌子高度 0.0)，強制定在安全高度
+        TABLE_HEIGHT = 0.005 # 假設桌子表面是 0，留 5mm 安全裕度
+        if real_target_xyz[2] < TABLE_HEIGHT:
+            rospy.logwarn(f"[Safety] 抓取深度過深 (Z={real_target_xyz[2]:.3f})，可能撞桌！已修正至安全高度。")
+            real_target_xyz[2] = TABLE_HEIGHT
 
-        # 2) 用 tcp_offset 把「物體位置」轉成「法蘭應該到的位置」
-        grasp_xyz = np.array(self.target_xyz) - ee_z * self.tcp_offset
+        rospy.loginfo(f"[p2p] deep_target (center) = ({real_target_xyz[0]:.3f}, {real_target_xyz[1]:.3f}, {real_target_xyz[2]:.3f})")
+        # ==========================================
+
+        # 2) 用 tcp_offset 把「修正後的深點」轉成「法蘭應該到的位置」
+        # 注意：這裡要用 real_target_xyz 來算
+        grasp_xyz = real_target_xyz - ee_z * self.tcp_offset
         ps_grasp = self.make_pose_stamped_from_xyz_rpy(grasp_xyz.tolist(), self.target_rpy_deg)
 
         gx, gy, gz = grasp_xyz
         rospy.loginfo("[p2p] grasp_xyz(flange) @ base (%.3f, %.3f, %.3f)", gx, gy, gz)
-
         # 3) 沿 -ee_z 方向拉出 Pre-Grasp
         approach_vec = -ee_z
         pre_xyz = grasp_xyz + approach_vec * self.approach_dist
@@ -380,10 +377,6 @@ class PoseToPick:
             rospy.logerr("[p2p] cartesian to grasp failed, abort")
             return
 
-        # try:
-        #     _ = input("[p2p] 已到抓取點，按空白+Enter 繼續：")
-        # except EOFError:
-        #     pass
 
         # 6) 夾爪關閉
         if self.g:  
@@ -400,6 +393,13 @@ class PoseToPick:
             self._last_grip_pos = target_pos
         else:
             rospy.logwarn("[grip] not connected, skip gripping")
+
+
+        try:
+            _ = input("[p2p] 已到抓取點，按空白+Enter 繼續：")
+        except EOFError:
+            pass
+
 
         # 7) 統一往 base_link +Z 方向抬升，而不是沿著夾爪 Z 軸
         retreat_xyz = [
