@@ -66,25 +66,24 @@ class SemanticGraspController:
         except Exception as e:
             rospy.logerr(f"TF 失敗: {e}"); return
 
-        # 🧙‍♂️ 座標軸對齊 (對齊你的夾爪)
+        # 🧙‍♂️ 座標軸對齊 (讓 UR3 的 Z 軸對齊 AnyGrasp 的 X 軸)
         q_orig = [ps_base.pose.orientation.x, ps_base.pose.orientation.y, 
                   ps_base.pose.orientation.z, ps_base.pose.orientation.w]
         
-        # 翻轉：AnyGrasp X -> UR3 Z，並旋轉 180 度讓夾爪面向自己
+        # 只要做這步：旋轉 Y 軸 -90 度，完美貼合 AnyGrasp 的姿態
         q_to_ur3 = quaternion_from_euler(0, -math.pi/2, 0) 
-        q_temp = quaternion_multiply(q_orig, q_to_ur3)
-        q_flip = quaternion_from_euler(0, 0, math.pi) 
-        q_new = quaternion_multiply(q_temp, q_flip)
+        q_final = quaternion_multiply(q_orig, q_to_ur3)
         
-        ps_base.pose.orientation.x, ps_base.pose.orientation.y, ps_base.pose.orientation.z, ps_base.pose.orientation.w = q_new
+        ps_base.pose.orientation.x, ps_base.pose.orientation.y, ps_base.pose.orientation.z, ps_base.pose.orientation.w = q_final
 
         # 🛡️ 安全檢查：如果夾爪「指向上方」，則再翻轉一次，防止撞桌
         ee_z = self.get_ee_z_axis_in_base(ps_base)
         if ee_z[2] > 0: # Z 軸向上
             rospy.logwarn("偵測到倒立姿態，自動修正方向...")
+            # 這裡的翻轉是為了救命(把由下往上抓，變成由上往下抓)，保留不動
             q_fix = quaternion_from_euler(math.pi, 0, 0)
-            q_final = quaternion_multiply(q_new, q_fix)
-            ps_base.pose.orientation.x, ps_base.pose.orientation.y, ps_base.pose.orientation.z, ps_base.pose.orientation.w = q_final
+            q_final_safe = quaternion_multiply(q_final, q_fix)
+            ps_base.pose.orientation.x, ps_base.pose.orientation.y, ps_base.pose.orientation.z, ps_base.pose.orientation.w = q_final_safe
 
         # 進入原本的 YOLO 邏輯
         self.run_once(ps_base)
@@ -155,11 +154,10 @@ class SemanticGraspController:
         self.group.set_start_state_to_current_state()
         self.group.set_pose_target(ps_pre)
         
-        plan_result = self.group.plan()
-        plan = plan_result[1] if isinstance(plan_result, tuple) else plan_result
+        success, plan, planning_time, error_code = self.group.plan()
 
-        if not plan or len(plan.joint_trajectory.points) == 0:
-            rospy.logerr("[p2p] 軌跡規劃失敗！目標可能太遠或撞到。")
+        if not success:
+            rospy.logerr(f"[p2p] 規劃失敗，錯誤代碼: {error_code}")
             return
 
         # 🛑 安全確認鎖 (你的最愛)

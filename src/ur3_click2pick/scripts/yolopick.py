@@ -346,7 +346,7 @@ class PoseToPick:
         rospy.loginfo(f"[p2p] deep_target (center) = ({real_target_xyz[0]:.3f}, {real_target_xyz[1]:.3f}, {real_target_xyz[2]:.3f})")
         # ==========================================
 
-        # 2) 用 tcp_offset 把「修正後的深點」轉成「法蘭應該到的位置」
+        # 2) 用 tcp_offset 把「物體位置」轉成「法蘭應該到的位置」
         # 注意：這裡要用 real_target_xyz 來算
         grasp_xyz = real_target_xyz - ee_z * self.tcp_offset
         ps_grasp = self.make_pose_stamped_from_xyz_rpy(grasp_xyz.tolist(), self.target_rpy_deg)

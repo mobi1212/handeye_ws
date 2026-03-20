@@ -19,7 +19,7 @@ class YoloClickNode:
         model_path = rospy.get_param("~model_path", default_path)
 
         rospy.loginfo(f"[YOLO] loading model from: {model_path}")
-        device = 0 if torch.cuda.is_available() else "cpu"
+        device = "cpu"
         self.model = YOLO(model_path).to(device)
         rospy.loginfo(f"[YOLO] model loaded on device: {device}")
 

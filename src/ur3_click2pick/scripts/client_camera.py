@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
+import sys
 import rospy
 import numpy as np
 import cv2
@@ -8,11 +8,13 @@ import zmq
 import time
 import zlib
 import pickle
+import moveit_commander
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped
 from cv_bridge import CvBridge, CvBridgeError
 from tf.transformations import quaternion_from_matrix
 from ultralytics import YOLO
+
 
 class AnyGraspROSClient:
     def __init__(self):
@@ -20,8 +22,8 @@ class AnyGraspROSClient:
         self.bridge = CvBridge()
         
         # --- 參數設定 ---
-        self.server_addr = "tcp://0.tcp.jp.ngrok.io:17429" # ⚠️ 請更新 Ngrok 網址
-        self.model_path = "/home/weilun/handeye_ws/src/object_detect_yolo/src/best.pt"
+        self.server_addr = "tcp://0.tcp.jp.ngrok.io:11753" # ⚠️ 請更新 Ngrok 網址
+        self.model_path = "/home/weilun/handeye_ws/src/ur3_click2pick/weights/best.pt"
         
         # --- 1. 初始化 YOLO ---
         print(f"🧠 載入 YOLO 模型: {self.model_path}")
@@ -43,6 +45,10 @@ class AnyGraspROSClient:
         # 暫存區
         self.cv_color = None
         self.cv_depth = None
+
+        self.scene = moveit_commander.PlanningSceneInterface()
+        # 呼叫加入桌子的函式
+        self.add_virtual_table()
         
         print("✅ ROS 節點已啟動，等待影像輸入...")
         print("👉 按下 [s] 發送至 AI 大腦，按下 [q] 退出。")
@@ -52,6 +58,26 @@ class AnyGraspROSClient:
             self.cv_color = self.bridge.imgmsg_to_cv2(data, "bgr8")
         except CvBridgeError as e:
             print(e)
+
+    def add_virtual_table(self):
+        rospy.loginfo("⏳ 正在建立虛擬桌面安全防線...")
+        rospy.sleep(2)  # 給 MoveIt 一點時間反應
+        
+        table_name = "safety_table"
+        table_pose = PoseStamped()
+        table_pose.header.frame_id = "base_link" # 參考手臂底座
+        
+        # 設定桌子位置 (中心點)
+        table_pose.pose.position.x = 0.0
+        table_pose.pose.position.y = 0.0
+        table_pose.pose.position.z = -0.05 # 在底座下方 2cm，可根據需求調整
+        table_pose.pose.orientation.w = 1.0
+        
+        # 設定桌子尺寸 (長, 寬, 厚度)
+        # 1.5公尺的正方形桌面，厚度 1cm
+        self.scene.add_box(table_name, table_pose, size=(1.5, 1.5, 0.01))
+        
+        rospy.loginfo("✅ 虛擬桌面防線已就位，夾爪現在不會撞擊桌面了。")
 
     def depth_callback(self, data):
         try:
@@ -72,15 +98,24 @@ class AnyGraspROSClient:
             results = self.yolo_model(display_img, verbose=False)
             boxes = results[0].boxes
             best_bbox = None
+            best_mask = None
             cls_name = "None"
 
             if boxes is not None and len(boxes) > 0:
                 confs = boxes.conf.cpu().numpy()
-                best_idx = int(np.argmax(confs))
+                best_idx = int(np.argmax(confs)) # 找出信心度最高的目標
+                
+                # 取得 Bounding Box
                 x1, y1, x2, y2 = map(int, boxes.xyxy.cpu().numpy()[best_idx])
                 best_bbox = [x1, y1, x2, y2]
                 cls_name = self.yolo_model.names.get(int(boxes.cls[best_idx]), "obj")
                 
+                # ✨ 新增：取得 Mask (如果模型有輸出遮罩)
+                if results[0].masks is not None:
+                    # 提取最高分目標的 2D 遮罩陣列
+                    best_mask = results[0].masks.data[best_idx].cpu().numpy()
+                
+                # 繪製畫面
                 cv2.rectangle(display_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 cv2.putText(display_img, f"{cls_name} {confs[best_idx]:.2f}", (x1, y1-10), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
@@ -91,12 +126,26 @@ class AnyGraspROSClient:
             if key & 0xFF == ord('q'):
                 break
             
+            # --- 當按下 [s] 發送時 ---
             if key & 0xFF == ord('s'):
-                if best_bbox is None or self.cv_depth is None:
-                    print("⚠️ 無法獲取目標或深度資訊。")
+                if best_bbox is None:
+                    print("⚠️ 無法獲取目標 (Bounding Box)！")
                     continue
                 
-                self.process_anygrasp(self.cv_color, self.cv_depth, best_bbox, cls_name)
+                if best_mask is None:
+                    print("⚠️ 警告：模型沒有輸出遮罩 (Mask)！將傳送原始深度圖...")
+                    clean_depth = self.cv_depth
+                else:
+                    print("🎯 啟動實例遮罩去背魔法...")
+                    # 1. 將遮罩調整為與深度圖相同的解析度
+                    mask_resized = cv2.resize(best_mask, (self.cv_depth.shape[1], self.cv_depth.shape[0]))
+                    
+                    # 2. 將深度圖與遮罩相乘 (去背)
+                    # astype(np.uint16) 非常重要，必須維持 RealSense 的 16-bit 格式
+                    clean_depth = self.cv_depth * mask_resized.astype(np.uint16)
+
+                # 發送去背後的 clean_depth 給大腦
+                self.process_anygrasp(self.cv_color, clean_depth, best_bbox, cls_name)
 
         cv2.destroyAllWindows()
 
@@ -155,5 +204,6 @@ class AnyGraspROSClient:
         cv2.destroyWindow("AR Preview (Press any key)")
 
 if __name__ == "__main__":
+    moveit_commander.roscpp_initialize(sys.argv)
     client = AnyGraspROSClient()
     client.run()
