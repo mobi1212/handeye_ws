@@ -16,6 +16,14 @@ devel_isolated/
 .DS_Store
 *.bag
 
+# Python cache
+__pycache__/
+
+# ROS/TF debug files
+*.pdf
+*.gv
+
+
 # ML weights & runs
 *.pt
 *.onnx
