@@ -22,7 +22,7 @@ class AnyGraspROSClient:
         self.bridge = CvBridge()
         
         # --- 參數設定 ---
-        self.server_addr = "tcp://0.tcp.jp.ngrok.io:11753" # ⚠️ 請更新 Ngrok 網址
+        self.server_addr = "tcp://0.tcp.jp.ngrok.io:15513" # ⚠️ 請更新 Ngrok 網址
         self.model_path = "/home/weilun/handeye_ws/src/ur3_click2pick/weights/best.pt"
         
         # --- 1. 初始化 YOLO ---
@@ -116,9 +116,7 @@ class AnyGraspROSClient:
                     best_mask = results[0].masks.data[best_idx].cpu().numpy()
                 
                 # 繪製畫面
-                cv2.rectangle(display_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(display_img, f"{cls_name} {confs[best_idx]:.2f}", (x1, y1-10), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                display_img = results[0].plot()
 
             cv2.imshow("AnyGrasp Client (ROS Mode)", display_img)
             key = cv2.waitKey(1)
@@ -136,13 +134,77 @@ class AnyGraspROSClient:
                     print("⚠️ 警告：模型沒有輸出遮罩 (Mask)！將傳送原始深度圖...")
                     clean_depth = self.cv_depth
                 else:
-                    print("🎯 啟動實例遮罩去背魔法...")
-                    # 1. 將遮罩調整為與深度圖相同的解析度
-                    mask_resized = cv2.resize(best_mask, (self.cv_depth.shape[1], self.cv_depth.shape[0]))
+                    print("🎯 啟動「邊緣斷開 + 強制保留桌面」魔法...")
                     
-                    # 2. 將深度圖與遮罩相乘 (去背)
-                    # astype(np.uint16) 非常重要，必須維持 RealSense 的 16-bit 格式
-                    clean_depth = self.cv_depth * mask_resized.astype(np.uint16)
+                    # 1. 取得二值化遮罩 (0 或是 1 的 uint8)
+                    mask_resized = cv2.resize(best_mask, (self.cv_depth.shape[1], self.cv_depth.shape[0]))
+                    obj_mask = (mask_resized > 0.5).astype(np.uint8)
+
+                    # ========== 舊版：護城河挖空法 (已註解保留) ==========
+                    # kernel = np.ones((25, 25), np.uint8)
+                    # dilated_mask = cv2.dilate(obj_mask, kernel, iterations=1)
+                    # melted_edge = cv2.subtract(dilated_mask, obj_mask)
+                    # full_preserve = np.ones_like(obj_mask, dtype=np.uint8)
+                    # final_mask = cv2.subtract(full_preserve, melted_edge)
+                    # clean_depth = self.cv_depth * final_mask.astype(np.uint16)
+                    # ====================================================
+
+                    # ========== 新版：SVD 3D 桌面平面擬合修復 ==========
+                    # 相機內參 (與 draw_ar_gripper 中一致)
+                    fx, fy = 617.183, 617.122
+                    cx, cy = 319.639, 241.404
+
+                    # 2. 建立遮罩：內圈 (跨過模糊帶)、外圈 (取鄰近桌面)
+                    kernel_inner = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+                    kernel_outer = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (40, 40))
+                    mask_inner = cv2.dilate(obj_mask, kernel_inner, iterations=1)
+                    mask_outer = cv2.dilate(obj_mask, kernel_outer, iterations=1)
+
+                    # 護城河 (待修補的過渡帶) = 膨脹15 - 原始物體遮罩
+                    moat_mask = cv2.subtract(mask_inner, obj_mask)
+                    # 甜甜圈 (純桌面取樣區) = 膨脹40 - 膨脹15
+                    table_donut_mask = cv2.subtract(mask_outer, mask_inner)
+
+                    # --- 視覺化預覽：儲存遮罩範圍至 RGB 影像 ---
+                    debug_img = self.cv_color.copy()
+                    # 將物體塗成綠色 (核心區)
+                    debug_img[obj_mask > 0] = debug_img[obj_mask > 0] * 0.5 + np.array([0, 255, 0]) * 0.5
+                    # 將護城河塗成紅色 (被壓平的過渡帶)
+                    debug_img[moat_mask > 0] = debug_img[moat_mask > 0] * 0.5 + np.array([0, 0, 255]) * 0.5
+                    # 將甜甜圈塗成藍色 (SVD 計算基準桌面帶)
+                    debug_img[table_donut_mask > 0] = debug_img[table_donut_mask > 0] * 0.5 + np.array([255, 0, 0]) * 0.5
+                    cv2.imwrite("/home/weilun/handeye_ws/donut_preview.jpg", debug_img)
+                    print("📸 已儲存甜甜圈遮罩預覽圖至: /home/weilun/handeye_ws/donut_preview.jpg")
+                    # ----------------------------------------------------
+
+                    # 3. 從甜甜圈提取 3D 點 (純桌面，不含物體)
+                    v_donut, u_donut = np.where((table_donut_mask > 0) & (self.cv_depth > 0))
+                    Z_donut = self.cv_depth[v_donut, u_donut].astype(np.float64)
+                    X_donut = (u_donut - cx) * Z_donut / fx
+                    Y_donut = (v_donut - cy) * Z_donut / fy
+                    points_3d = np.stack((X_donut, Y_donut, Z_donut), axis=-1)
+
+                    # 4. SVD 平面擬合：求 aX + bY + cZ + d = 0
+                    centroid = np.mean(points_3d, axis=0)
+                    centered = points_3d - centroid
+                    _, _, Vt = np.linalg.svd(centered, full_matrices=False)
+                    normal = Vt[-1]  # 最小奇異值對應的向量 = 平面法向量
+                    a, b, c = normal
+                    d = -np.dot(normal, centroid)
+
+                    # 5. 射線投影回填：對護城河每個像素計算桌面深度
+                    v_moat, u_moat = np.where(moat_mask > 0)
+                    if len(v_moat) > 0:
+                        denom = a * (u_moat - cx) / fx + b * (v_moat - cy) / fy + c
+                        denom = np.where(denom == 0, 1e-6, denom)  # 防止除零
+                        Z_filled = -d / denom
+                        Z_filled = np.clip(Z_filled, 0, 65535)     # uint16 安全範圍
+
+                        clean_depth = self.cv_depth.copy()
+                        clean_depth[v_moat, u_moat] = Z_filled.astype(np.uint16)
+                    else:
+                        clean_depth = self.cv_depth.copy()
+                    # ====================================================
 
                 # 發送去背後的 clean_depth 給大腦
                 self.process_anygrasp(self.cv_color, clean_depth, best_bbox, cls_name)
@@ -167,20 +229,19 @@ class AnyGraspROSClient:
 
         if result['status'] == 'success':
             print(f"🎯 獲得 6D 座標，分數: {result['score']:.4f}")
-            
-            # --- 4. 發佈 ROS Pose ---
+        # --- 4. 發佈 ROS Pose ---
             tvec = np.array(result['translation'])
             rot_mat = np.array(result['rotation'])
             
             pose_msg = PoseStamped()
-            pose_msg.header.frame_id = "camera_link"
+            pose_msg.header.frame_id = "camera_color_optical_frame"
             pose_msg.header.stamp = rospy.Time.now()
+            
             pose_msg.pose.position.x, pose_msg.pose.position.y, pose_msg.pose.position.z = tvec
             
             T = np.eye(4); T[:3, :3] = rot_mat
             q = quaternion_from_matrix(T)
             pose_msg.pose.orientation.x, pose_msg.pose.orientation.y, pose_msg.pose.orientation.z, pose_msg.pose.orientation.w = q
-            
             self.pose_pub.publish(pose_msg)
             print("🚀 座標已發射！請在 RViz 查看彩色座標軸。")
 

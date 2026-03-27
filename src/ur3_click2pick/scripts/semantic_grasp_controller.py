@@ -20,9 +20,9 @@ class SemanticGraspController:
         self.base_frame  = rospy.get_param("~base_frame", "base_link")
         self.move_group  = rospy.get_param("~move_group", "manipulator")
 
-        self.tcp_offset    = float(rospy.get_param("~tcp_offset", 0.163))
-        self.grasp_depth   = float(rospy.get_param("~grasp_depth", 0.03)) 
-        self.approach_dist = float(rospy.get_param("~approach_dist", 0.1))
+        self.tcp_offset    = float(rospy.get_param("~tcp_offset", 0.18))
+        self.grasp_depth   = float(rospy.get_param("~grasp_depth", 0.04)) 
+        self.approach_dist = float(rospy.get_param("~approach_dist", 0.05))
         
         self.retreat_up_height   = float(rospy.get_param("~retreat_up_height", 0.15)) 
         self.post_open_up_height = float(rospy.get_param("~post_open_up_height", 0.1)) 
@@ -32,7 +32,7 @@ class SemanticGraspController:
         self.acc_scale   = float(rospy.get_param("~acc_scale",  0.10))
 
         # 固定放置位置
-        self.final_xyz     = [0.2, 0.1, 0.165]
+        self.final_xyz     = [0.2, 0.1, 0.185]
         self.final_rpy_deg = [180.0, 0.0, 0.0]
 
         # 夾爪
@@ -129,10 +129,10 @@ class SemanticGraspController:
         real_target_xyz = np.array(target_xyz) + (ee_z * self.grasp_depth)
         
         # 安全檢查 (撞桌保護)
-        TABLE_HEIGHT = 0.005 
-        if real_target_xyz[2] < TABLE_HEIGHT:
-            rospy.logwarn(f"[Safety] 修正深度防止撞桌 (Z={real_target_xyz[2]:.3f})")
-            real_target_xyz[2] = TABLE_HEIGHT
+        # TABLE_HEIGHT = 0.005 
+        # if real_target_xyz[2] < TABLE_HEIGHT:
+        #     rospy.logwarn(f"[Safety] 修正深度防止撞桌 (Z={real_target_xyz[2]:.3f})")
+        #     real_target_xyz[2] = TABLE_HEIGHT
 
         # 3. 算出法蘭目標 (Grasp Pose)
         grasp_xyz = real_target_xyz - ee_z * self.tcp_offset
