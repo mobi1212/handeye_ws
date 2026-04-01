@@ -4,7 +4,7 @@
   <arg name="cam_frame"       default="camera_color_optical_frame"/>
   <arg name="move_group"      default="manipulator"/>
   <arg name="ee_link"         default="tool0_controller"/>
-  <arg name="approach_z"      default="0.15"/>   <!-- m，初測保守 -->
+  <arg name="approach_z"      default="0.05"/>   <!-- m，初測保守 -->
   <arg name="hover_z"         default="0.03"/>   <!-- m -->
   <arg name="max_vel_scaling" default="0.2"/>
   <arg name="max_acc_scaling" default="0.2"/>

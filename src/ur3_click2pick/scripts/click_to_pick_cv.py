@@ -39,7 +39,7 @@ class ClickToPickCV:
         # 跟第一支一樣的預設姿態：(0, 180, 0)
         self.ee_rpy_deg  = tuple(rospy.get_param("~ee_rpy_deg", [0.0, 180.0, 0.0]))
 
-        self.approach_z  = float(rospy.get_param("~approach_z", 0.15))  # 上方 m
+        self.approach_z  = float(rospy.get_param("~approach_z", 0.05))  # 上方 m
         self.lift_z      = float(rospy.get_param("~lift_z",     0.13))  # 抬升 m
         self.eef_step    = float(rospy.get_param("~eef_step",   0.01))  # 笛卡兒步長 m
         self.vel_scale   = float(rospy.get_param("~vel_scale",  0.10))

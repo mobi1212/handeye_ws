@@ -43,7 +43,7 @@ class PoseToPick:
         self.tcp_offset = float(rospy.get_param("~tcp_offset", 0.16))
 
         # pre-grasp 距離（沿 -ee_z 方向），retreat_dist 現在僅保留參數，不再使用
-        self.approach_dist = float(rospy.get_param("~approach_dist", 0.10))  # m
+        self.approach_dist = float(rospy.get_param("~approach_dist", 0.05))  # m
         self.retreat_dist  = float(rospy.get_param("~retreat_dist",  0.10))  # m（未使用）
 
         # 統一往上抬升的高度（grasp 之後）
