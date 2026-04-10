@@ -2,15 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 Semantic Grasp Controller (AnyGrasp 6D Pose 接收版)
-完全移植 PoseToPick (YOLO) 邏輯版本
+完全移植 PoseToPick (YOLO) 邏輯版本 + 滿血版動態避障 ACM + 虛擬夾爪防護罩
 """
 
 import os, sys, math, numpy as np
 import rospy
 from geometry_msgs.msg import PoseStamped
 from tf.transformations import quaternion_matrix, quaternion_multiply, quaternion_from_euler
-from moveit_commander import MoveGroupCommander, roscpp_initialize
+from moveit_commander import MoveGroupCommander, PlanningSceneInterface, roscpp_initialize
 import tf2_ros, tf2_geometry_msgs
+
+from moveit_msgs.msg import PlanningScene as PlanningSceneMsg, AllowedCollisionEntry
+from moveit_msgs.srv import ApplyPlanningScene, GetPlanningScene
 
 from robotiq_gripper import RobotiqGripper
 
@@ -47,8 +50,12 @@ class SemanticGraspController:
         self.group.set_max_velocity_scaling_factor(self.vel_scale)
         self.group.set_max_acceleration_scaling_factor(self.acc_scale)
 
+        self.scene = PlanningSceneInterface()
         self.g = RobotiqGripper()
         self.init_gripper()
+        
+        # 🆕 動態附加虛擬夾爪防護罩 (解決 Octomap 幽靈夾爪問題)
+        self.attach_virtual_gripper_shield()
 
         self.tfbuf = tf2_ros.Buffer(cache_time=rospy.Duration(10.0))
         self.tflis = tf2_ros.TransformListener(self.tfbuf)
@@ -56,6 +63,30 @@ class SemanticGraspController:
         # 訂閱 AnyGrasp
         self.pose_sub = rospy.Subscriber("/anygrasp/target_pose", PoseStamped, self.cb_anygrasp_pose, queue_size=1)
         rospy.loginfo("[p2p] AnyGrasp 邏輯啟動，等待目標姿態...")
+
+    def attach_virtual_gripper_shield(self):
+        """為 tool0 戴上隱形方塊，讓 MoveIt 自動過濾掉實體夾爪的點雲"""
+        rospy.loginfo("🛡️ 正在為 tool0 裝備「虛擬夾爪防護罩」...")
+        rospy.sleep(1.0)  # 給 PlanningScene 一點時間連線
+        
+        shield_pose = PoseStamped()
+        shield_pose.header.frame_id = "tool0"
+        
+        # 將防護罩中心往前方推，剛好包覆住整支 Robotiq 夾爪
+        shield_pose.pose.position.x = 0.0
+        shield_pose.pose.position.y = 0.0
+        shield_pose.pose.position.z = 0.08  # Z 軸往前 8 公分 (夾爪的中心大約在這裡)
+        shield_pose.pose.orientation.w = 1.0
+        
+        # 建立隱形方塊 (保留您微調過的尺寸)
+        shield_size = (0.08, 0.21, 0.18)
+        
+        # 🌟 關鍵修復：明確告訴 MoveIt 這個防護罩是穿在手上的，允許它合法穿透手腕！
+        allowed_touch = ['tool0', 'flange', 'wrist_3_link', 'wrist_2_link']
+        
+        # 關鍵神技：attach_box 會讓這個方塊變成手臂的一部分，並加上豁免清單
+        self.scene.attach_box("tool0", "virtual_gripper_shield", shield_pose, size=shield_size, touch_links=allowed_touch)
+        rospy.loginfo("✅ 虛擬夾爪防護罩已綁定！Octomap 將自動過濾此範圍內的點雲 (已豁免手臂本體碰撞)。")
 
     # ---------- 姿態處理：AnyGrasp -> UR3 ----------
     def cb_anygrasp_pose(self, msg: PoseStamped):
@@ -88,7 +119,7 @@ class SemanticGraspController:
         # 進入原本的 YOLO 邏輯
         self.run_once(ps_base)
 
-    # ---------- Helpers (完全移植自你的代碼) ----------
+    # ---------- Helpers ----------
     def plan_execute_cartesian_to(self, target_pose):
         self.group.set_start_state_to_current_state()
         wp = target_pose.pose if isinstance(target_pose, PoseStamped) else target_pose
@@ -117,7 +148,69 @@ class SemanticGraspController:
             rospy.sleep(1.0); self.g.move_and_wait_for_pos(0, 100, 80)
         except: self.g = None
 
-    # ---------- 核心流程 (完全對齊 PoseToPick) ----------
+    # ---------- ACM 特許碰撞矩陣 (滿血防護罩優化版) ----------
+    def allow_gripper_collision(self):
+        """允許夾爪群組與 target_box 及 safety_table 發生合法碰撞"""
+        from moveit_msgs.msg import PlanningSceneComponents
+        
+        # 🆕 確保將防護罩 (virtual_gripper_shield) 加入白名單
+        gripper_links = [
+            "wrist_3_link", "flange", "tool0", 
+            "virtual_gripper_shield",        # <--- 最重要的新增
+            "robotiq_arg2f_base_link", 
+            "left_inner_knuckle", "right_inner_knuckle",
+            "left_outer_knuckle", "right_outer_knuckle",
+            "left_inner_finger", "right_inner_finger",
+            "left_inner_finger_pad", "right_inner_finger_pad"
+        ]
+        
+        target_objects = ["target_box", "safety_table"]
+
+        try:
+            rospy.wait_for_service('/get_planning_scene', timeout=5.0)
+            rospy.wait_for_service('/apply_planning_scene', timeout=5.0)
+            get_scene = rospy.ServiceProxy('/get_planning_scene', GetPlanningScene)
+            apply_scene = rospy.ServiceProxy('/apply_planning_scene', ApplyPlanningScene)
+
+            # 正確取得目前的 ACM
+            req_comp = PlanningSceneComponents()
+            req_comp.components = PlanningSceneComponents.ALLOWED_COLLISION_MATRIX
+            resp = get_scene(components=req_comp)
+            acm = resp.scene.allowed_collision_matrix
+
+            # 🛠️ 優化：動態擴充 ACM 矩陣 (確保所有目標和防護罩都在矩陣內)
+            all_objects = target_objects + gripper_links
+            for obj in all_objects:
+                if obj not in acm.entry_names:
+                    acm.entry_names.append(obj)
+                    new_entry = AllowedCollisionEntry()
+                    new_entry.enabled = [False] * (len(acm.entry_names) - 1)
+                    acm.entry_values.append(new_entry)
+                    for entry in acm.entry_values:
+                        while len(entry.enabled) < len(acm.entry_names):
+                            entry.enabled.append(False)
+
+            # 打通夾爪與目標物/桌面的雙向碰撞許可
+            for g_link in gripper_links:
+                if g_link in acm.entry_names:
+                    idx_g = acm.entry_names.index(g_link)
+                    for obj in target_objects:
+                        if obj in acm.entry_names:
+                            idx_o = acm.entry_names.index(obj)
+                            acm.entry_values[idx_g].enabled[idx_o] = True
+                            acm.entry_values[idx_o].enabled[idx_g] = True
+
+            # 寫回 PlanningScene
+            scene_msg = PlanningSceneMsg()
+            scene_msg.allowed_collision_matrix = acm
+            scene_msg.is_diff = True
+            apply_scene(scene_msg)
+            rospy.loginfo(f"🎫 ACM 已授權: 夾爪(含防護罩) 可無礙觸碰 {target_objects}")
+
+        except Exception as e:
+            rospy.logwarn(f"ACM 設定失敗: {e}")
+
+    # ---------- 核心流程 ----------
     def run_once(self, ps_target):
         # 1. 取得目標位置與 ee_z 方向
         target_xyz = [ps_target.pose.position.x, ps_target.pose.position.y, ps_target.pose.position.z]
@@ -127,12 +220,6 @@ class SemanticGraspController:
 
         # 2. 應用抓取深度
         real_target_xyz = np.array(target_xyz) + (ee_z * self.grasp_depth)
-        
-        # 安全檢查 (撞桌保護)
-        TABLE_HEIGHT = 0.001
-        if real_target_xyz[2] < TABLE_HEIGHT:
-            rospy.logwarn(f"[Safety] 修正深度防止撞桌 (Z={real_target_xyz[2]:.3f})")
-            real_target_xyz[2] = TABLE_HEIGHT
 
         # 3. 算出法蘭目標 (Grasp Pose)
         grasp_xyz = real_target_xyz - ee_z * self.tcp_offset
@@ -141,15 +228,18 @@ class SemanticGraspController:
         ps_grasp.pose.position.x, ps_grasp.pose.position.y, ps_grasp.pose.position.z = grasp_xyz
         ps_grasp.pose.orientation = ps_target.pose.orientation
 
-        # 4. 算出 Pre-Grasp (同樣用你的邏輯：grasp_xyz - ee_z * approach_dist)
+        # 4. 算出 Pre-Grasp 
         pre_xyz = grasp_xyz - ee_z * self.approach_dist
         ps_pre = PoseStamped()
         ps_pre.header.frame_id = self.base_frame
         ps_pre.pose.position.x, ps_pre.pose.position.y, ps_pre.pose.position.z = pre_xyz
         ps_pre.pose.orientation = ps_target.pose.orientation
 
-        # --- 執行手臂動作 (加入你的手動確認邏輯) ---
-        
+        # --- 執行手臂動作 ---
+
+        # 🎫 ACM 白名單：允許夾爪與防護罩穿透目標
+        self.allow_gripper_collision()
+
         # 動作 A: Go to Pre-Grasp (關節規劃)
         self.group.set_start_state_to_current_state()
         self.group.set_pose_target(ps_pre)
@@ -160,7 +250,7 @@ class SemanticGraspController:
             rospy.logerr(f"[p2p] 規劃失敗，錯誤代碼: {error_code}")
             return
 
-        # 🛑 安全確認鎖 (你的最愛)
+        # 🛑 安全確認鎖
         try:
             print("\n==================================================")
             ans = input("⚠️ [安全鎖] 軌跡已顯示在 RViz！確認安全請按 [Enter]，取消請按 [n]：")
@@ -181,7 +271,7 @@ class SemanticGraspController:
         try: input("[p2p] 已夾取，按 Enter 抬升放置...")
         except EOFError: pass
 
-        # 動作 D: 抬升 (沿用你的 Z+ 抬升邏輯)
+        # 動作 D: 抬升 
         retreat_xyz = [grasp_xyz[0], grasp_xyz[1], grasp_xyz[2] + self.retreat_up_height]
         ps_retreat_up = PoseStamped()
         ps_retreat_up.header.frame_id = self.base_frame

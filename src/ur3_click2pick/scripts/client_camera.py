@@ -22,7 +22,7 @@ class AnyGraspROSClient:
         self.bridge = CvBridge()
         
         # --- 參數設定 ---
-        self.server_addr = "tcp://0.tcp.jp.ngrok.io:15513" # ⚠️ 請更新 Ngrok 網址
+        self.server_addr = "tcp://0.tcp.jp.ngrok.io:17721" # ⚠️ 請更新 Ngrok 網址
         self.model_path = "/home/weilun/handeye_ws/src/ur3_click2pick/weights/best.pt"
         
         # --- 1. 初始化 YOLO ---
@@ -37,14 +37,21 @@ class AnyGraspROSClient:
         
         # --- 3. ROS 發佈與訂閱 ---
         self.pose_pub = rospy.Publisher('/anygrasp/target_pose', PoseStamped, queue_size=1)
+        # 🆕 發佈過濾情報 — 給 MoveIt Octomap 用的「動態去除目標物」深度圖
+        self.filtered_depth_pub = rospy.Publisher('/camera/filtered_depth', Image, queue_size=1)
+        self.camera_info_pub = rospy.Publisher('/camera/camera_info', CameraInfo, queue_size=1)
+        self.depth_header = None
+        self.cached_camera_info = None
         
         # 訂閱影像與深度 (由 rs_camera.launch 提供)
         self.color_sub = rospy.Subscriber("/camera/color/image_raw", Image, self.color_callback)
         self.depth_sub = rospy.Subscriber("/camera/aligned_depth_to_color/image_raw", Image, self.depth_callback)
+        self.info_sub = rospy.Subscriber("/camera/aligned_depth_to_color/camera_info", CameraInfo, self.camera_info_callback)
         
-        # 暫存區
+        # 暫存區與隱形斗篷遮罩
         self.cv_color = None
         self.cv_depth = None
+        self.cloak_mask = None  # 🆕 用來記錄目標物位置的 2D 遮罩，全時動態套用
 
         self.scene = moveit_commander.PlanningSceneInterface()
         # 呼叫加入桌子的函式
@@ -70,26 +77,56 @@ class AnyGraspROSClient:
         # 設定桌子位置 (中心點)
         table_pose.pose.position.x = 0.0
         table_pose.pose.position.y = 0.0
-        table_pose.pose.position.z = -0.05 # 在底座下方 2cm，可根據需求調整
+        table_pose.pose.position.z = -0.015  # 🚀 中心提升至 Z=-0.015m，徹底吞噬桌面雜訊
         table_pose.pose.orientation.w = 1.0
         
         # 設定桌子尺寸 (長, 寬, 厚度)
-        # 1.5公尺的正方形桌面，厚度 1cm
-        self.scene.add_box(table_name, table_pose, size=(1.5, 1.5, 0.01))
+        # 厚度 6cm: 頂面 Z=+0.015m 底面 Z=-0.045m
+        self.scene.add_box(table_name, table_pose, size=(1.5, 1.5, 0.06))
         
-        rospy.loginfo("✅ 虛擬桌面防線已就位，夾爪現在不會撞擊桌面了。")
+        rospy.loginfo("✅ 虛擬桌面安全防線已就位 (Self-Filtering 模式)。")
+
+    def camera_info_callback(self, data):
+        self.cached_camera_info = data
 
     def depth_callback(self, data):
         try:
+            self.depth_header = data.header
             # 轉換為 16-bit uint (RealSense 原生格式)
             self.cv_depth = self.bridge.imgmsg_to_cv2(data, "16UC1")
+            # 🚀 移除了凍結影像的判斷式，現在每一幀都是最新的！
         except CvBridgeError as e:
             print(e)
 
+    def publish_depth_to_octomap(self):
+        """每一幀持續發佈即時深度圖 + CameraInfo 給 MoveIt Octomap"""
+        if self.cv_depth is not None and self.depth_header is not None and self.cached_camera_info is not None:
+            # 1. 永遠拿取最新的即時深度圖
+            live_depth = self.cv_depth.copy()
+            
+            # 2. 如果已經鎖定目標 (按過 s)，就在最新畫面上蓋上隱形斗篷
+            if self.cloak_mask is not None:
+                live_depth[self.cloak_mask > 0] = 0
+                
+            # 3. 發佈給 Octomap 引擎 (桌面由 safety_table Self-Filtering 自動剔除)
+            depth_msg = self.bridge.cv2_to_imgmsg(live_depth, "16UC1")
+            depth_msg.header = self.depth_header
+            self.filtered_depth_pub.publish(depth_msg)
+            
+            # 同步發佈 CameraInfo
+            info_msg = self.cached_camera_info
+            info_msg.header = self.depth_header
+            self.camera_info_pub.publish(info_msg)
+
     def run(self):
+        rate = rospy.Rate(10)
         while not rospy.is_shutdown():
             if self.cv_color is None:
+                rate.sleep()
                 continue
+
+            # 🔄 每一幀都發佈即時深度圖給 MoveIt Octomap
+            self.publish_depth_to_octomap()
 
             # 複製一份影像用於顯示
             display_img = self.cv_color.copy()
@@ -110,9 +147,8 @@ class AnyGraspROSClient:
                 best_bbox = [x1, y1, x2, y2]
                 cls_name = self.yolo_model.names.get(int(boxes.cls[best_idx]), "obj")
                 
-                # ✨ 新增：取得 Mask (如果模型有輸出遮罩)
+                # 取得 Mask
                 if results[0].masks is not None:
-                    # 提取最高分目標的 2D 遮罩陣列
                     best_mask = results[0].masks.data[best_idx].cpu().numpy()
                 
                 # 繪製畫面
@@ -136,69 +172,53 @@ class AnyGraspROSClient:
                 else:
                     print("🎯 啟動「邊緣斷開 + 強制保留桌面」魔法...")
                     
-                    # 1. 取得二值化遮罩 (0 或是 1 的 uint8)
+                    # 1. 取得二值化遮罩
                     mask_resized = cv2.resize(best_mask, (self.cv_depth.shape[1], self.cv_depth.shape[0]))
                     obj_mask = (mask_resized > 0.5).astype(np.uint8)
 
-                    # ========== 舊版：護城河挖空法 (已註解保留) ==========
-                    # kernel = np.ones((25, 25), np.uint8)
-                    # dilated_mask = cv2.dilate(obj_mask, kernel, iterations=1)
-                    # melted_edge = cv2.subtract(dilated_mask, obj_mask)
-                    # full_preserve = np.ones_like(obj_mask, dtype=np.uint8)
-                    # final_mask = cv2.subtract(full_preserve, melted_edge)
-                    # clean_depth = self.cv_depth * final_mask.astype(np.uint16)
-                    # ====================================================
-
-                    # ========== 新版：SVD 3D 桌面平面擬合修復 ==========
-                    # 相機內參 (與 draw_ar_gripper 中一致)
+                    # ========== SVD 3D 桌面平面擬合修復 ==========
                     fx, fy = 617.183, 617.122
                     cx, cy = 319.639, 241.404
 
-                    # 2. 建立遮罩：內圈 (跨過模糊帶)、外圈 (取鄰近桌面)
+                    # 2. 建立遮罩：內圈與外圈
                     kernel_inner = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
                     kernel_outer = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (40, 40))
                     mask_inner = cv2.dilate(obj_mask, kernel_inner, iterations=1)
                     mask_outer = cv2.dilate(obj_mask, kernel_outer, iterations=1)
 
-                    # 護城河 (待修補的過渡帶) = 膨脹15 - 原始物體遮罩
                     moat_mask = cv2.subtract(mask_inner, obj_mask)
-                    # 甜甜圈 (純桌面取樣區) = 膨脹40 - 膨脹15
                     table_donut_mask = cv2.subtract(mask_outer, mask_inner)
 
-                    # --- 視覺化預覽：儲存遮罩範圍至 RGB 影像 ---
+                    # --- 視覺化預覽 ---
                     debug_img = self.cv_color.copy()
-                    # 將物體塗成綠色 (核心區)
                     debug_img[obj_mask > 0] = debug_img[obj_mask > 0] * 0.5 + np.array([0, 255, 0]) * 0.5
-                    # 將護城河塗成紅色 (被壓平的過渡帶)
                     debug_img[moat_mask > 0] = debug_img[moat_mask > 0] * 0.5 + np.array([0, 0, 255]) * 0.5
-                    # 將甜甜圈塗成藍色 (SVD 計算基準桌面帶)
                     debug_img[table_donut_mask > 0] = debug_img[table_donut_mask > 0] * 0.5 + np.array([255, 0, 0]) * 0.5
                     cv2.imwrite("/home/weilun/handeye_ws/donut_preview.jpg", debug_img)
                     print("📸 已儲存甜甜圈遮罩預覽圖至: /home/weilun/handeye_ws/donut_preview.jpg")
-                    # ----------------------------------------------------
 
-                    # 3. 從甜甜圈提取 3D 點 (純桌面，不含物體)
+                    # 3. 提取 3D 點
                     v_donut, u_donut = np.where((table_donut_mask > 0) & (self.cv_depth > 0))
                     Z_donut = self.cv_depth[v_donut, u_donut].astype(np.float64)
                     X_donut = (u_donut - cx) * Z_donut / fx
                     Y_donut = (v_donut - cy) * Z_donut / fy
                     points_3d = np.stack((X_donut, Y_donut, Z_donut), axis=-1)
 
-                    # 4. SVD 平面擬合：求 aX + bY + cZ + d = 0
+                    # 4. SVD 平面擬合
                     centroid = np.mean(points_3d, axis=0)
                     centered = points_3d - centroid
                     _, _, Vt = np.linalg.svd(centered, full_matrices=False)
-                    normal = Vt[-1]  # 最小奇異值對應的向量 = 平面法向量
+                    normal = Vt[-1]
                     a, b, c = normal
                     d = -np.dot(normal, centroid)
 
-                    # 5. 射線投影回填：對護城河每個像素計算桌面深度
+                    # 5. 射線投影回填 (AnyGrasp 大腦專用)
                     v_moat, u_moat = np.where(moat_mask > 0)
                     if len(v_moat) > 0:
                         denom = a * (u_moat - cx) / fx + b * (v_moat - cy) / fy + c
-                        denom = np.where(denom == 0, 1e-6, denom)  # 防止除零
+                        denom = np.where(denom == 0, 1e-6, denom)
                         Z_filled = -d / denom
-                        Z_filled = np.clip(Z_filled, 0, 65535)     # uint16 安全範圍
+                        Z_filled = np.clip(Z_filled, 0, 65535)
 
                         clean_depth = self.cv_depth.copy()
                         clean_depth[v_moat, u_moat] = Z_filled.astype(np.uint16)
@@ -206,8 +226,37 @@ class AnyGraspROSClient:
                         clean_depth = self.cv_depth.copy()
                     # ====================================================
 
+                    # 🚀 記錄隱形斗篷遮罩 (全時動態套用)
+                    self.cloak_mask = cv2.bitwise_or(obj_mask, moat_mask)
+                    print("🛡️ 已啟動全時隱形斗篷！Octomap 將持續動態更新，但目標物區域永久隱形。")
+
+                    # 🆕 生成 YOLO 實體防撞方塊給 MoveIt
+                    v_obj, u_obj = np.where((obj_mask > 0) & (self.cv_depth > 0))
+                    if len(v_obj) > 0:
+                        Z_obj = self.cv_depth[v_obj, u_obj].astype(np.float64) / 1000.0
+                        X_obj = (u_obj - cx) * Z_obj / fx
+                        Y_obj = (v_obj - cy) * Z_obj / fy
+                        
+                        min_x, max_x = np.percentile(X_obj, 5), np.percentile(X_obj, 95)
+                        min_y, max_y = np.percentile(Y_obj, 5), np.percentile(Y_obj, 95)
+                        min_z, max_z = np.percentile(Z_obj, 5), np.percentile(Z_obj, 95)
+                        
+                        box_size = (max_x - min_x + 0.02, max_y - min_y + 0.02, max_z - min_z + 0.02)
+                        
+                        box_pose = PoseStamped()
+                        box_pose.header.frame_id = "camera_color_optical_frame"
+                        box_pose.pose.position.x = (max_x + min_x) / 2
+                        box_pose.pose.position.y = (max_y + min_y) / 2
+                        box_pose.pose.position.z = (max_z + min_z) / 2
+                        box_pose.pose.orientation.w = 1.0
+                        
+                        self.scene.add_box("target_box", box_pose, size=box_size)
+                        print(f"📦 發佈 target_box 防撞方塊, 尺寸: {box_size[0]:.3f}x{box_size[1]:.3f}x{box_size[2]:.3f}m")
+
                 # 發送去背後的 clean_depth 給大腦
                 self.process_anygrasp(self.cv_color, clean_depth, best_bbox, cls_name)
+
+            rate.sleep()
 
         cv2.destroyAllWindows()
 
@@ -215,21 +264,17 @@ class AnyGraspROSClient:
         print(f"\n📤 正在發送目標 [{name}] 至桌機運算...")
         start_t = time.time()
 
-        # 1. 極限壓縮
         _, encoded = cv2.imencode('.jpg', color, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
         payload = {'color_jpg': encoded, 'depth': depth, 'bbox': bbox}
         
-        # 2. 發送
         compressed = zlib.compress(pickle.dumps(payload))
         self.socket.send(compressed)
         
-        # 3. 接收
         result = self.socket.recv_pyobj()
         print(f"⏱️ 耗時: {time.time() - start_t:.2f}s")
 
         if result['status'] == 'success':
             print(f"🎯 獲得 6D 座標，分數: {result['score']:.4f}")
-        # --- 4. 發佈 ROS Pose ---
             tvec = np.array(result['translation'])
             rot_mat = np.array(result['rotation'])
             
@@ -245,7 +290,6 @@ class AnyGraspROSClient:
             self.pose_pub.publish(pose_msg)
             print("🚀 座標已發射！請在 RViz 查看彩色座標軸。")
 
-            # --- 5. AR 預覽繪製 (確認邏輯) ---
             self.draw_ar_gripper(color, result)
 
     def draw_ar_gripper(self, img, res):
