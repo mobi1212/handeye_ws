@@ -10,11 +10,17 @@ import zmq
 import time
 import zlib
 import pickle
-import moveit_commander
+try:
+    import moveit_commander
+    MOVEIT_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️  moveit_commander 無法載入（無手臂模式）: {e}")
+    MOVEIT_AVAILABLE = False
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String
-from cv_bridge import CvBridge, CvBridgeError
+# cv_bridge 在 conda 環境下有 libffi 衝突，改用手動轉換
+# from cv_bridge import CvBridge, CvBridgeError
 from tf.transformations import quaternion_from_matrix
 from ultralytics import YOLO
 
@@ -23,10 +29,9 @@ ZMQ_RECV_TIMEOUT_MS = 30000  # 30 秒無回應則放棄
 class AnyGraspROSClient:
     def __init__(self):
         rospy.init_node('anygrasp_ros_client', anonymous=True)
-        self.bridge = CvBridge()
         
         # --- 參數設定 ---
-        self.server_addr = "tcp://0.tcp.jp.ngrok.io:17721" # ⚠️ 請更新 Ngrok 網址
+        self.server_addr = "tcp://0.tcp.jp.ngrok.io:15022" # ⚠️ 請更新 Ngrok 網址
         self.model_path = "/home/weilun/handeye_ws/src/ur3_click2pick/weights/best.pt"
         
         # --- 1. 初始化 YOLO ---
@@ -69,8 +74,9 @@ class AnyGraspROSClient:
         self.cy = None
         self.camera_info_sub = rospy.Subscriber("/camera/color/camera_info", CameraInfo, self.camera_info_callback)
 
-        self.scene = moveit_commander.PlanningSceneInterface()
-        self.add_virtual_table()
+        if MOVEIT_AVAILABLE:
+            self.scene = moveit_commander.PlanningSceneInterface()
+            self.add_virtual_table()
         
         print("✅ ROS 節點已啟動，等待影像輸入...")
         print("-" * 50)
@@ -107,9 +113,12 @@ class AnyGraspROSClient:
 
     def color_callback(self, data):
         try:
-            self.cv_color = self.bridge.imgmsg_to_cv2(data, "bgr8")
-        except CvBridgeError as e:
-            print(e)
+            img = np.frombuffer(data.data, dtype=np.uint8).reshape(data.height, data.width, -1)
+            if data.encoding == "rgb8":
+                img = img[:, :, ::-1]  # RGB → BGR
+            self.cv_color = np.ascontiguousarray(img)
+        except Exception as e:
+            print(f"color_callback error: {e}")
 
     def add_virtual_table(self):
         rospy.loginfo("⏳ 正在建立虛擬桌面安全防線...")
@@ -126,9 +135,9 @@ class AnyGraspROSClient:
 
     def depth_callback(self, data):
         try:
-            self.cv_depth = self.bridge.imgmsg_to_cv2(data, "16UC1")
-        except CvBridgeError as e:
-            print(e)
+            self.cv_depth = np.frombuffer(data.data, dtype=np.uint16).reshape(data.height, data.width)
+        except Exception as e:
+            print(f"depth_callback error: {e}")
 
     def run(self):
         while not rospy.is_shutdown():
@@ -342,6 +351,7 @@ class AnyGraspROSClient:
         cv2.destroyWindow("AR Preview (Press any key)")
 
 if __name__ == "__main__":
-    moveit_commander.roscpp_initialize(sys.argv)
+    if MOVEIT_AVAILABLE:
+        moveit_commander.roscpp_initialize(sys.argv)
     client = AnyGraspROSClient()
     client.run()

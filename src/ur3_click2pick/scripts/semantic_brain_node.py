@@ -31,20 +31,18 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import String
 from PIL import Image as PILImage
 from transformers import pipeline, SamModel, SamProcessor
-import google.generativeai as genai
+from google import genai
 import warnings
 
 warnings.filterwarnings('ignore')
 
-# --- API Key 安全性：從環境變數讀取，嚴禁寫死 ---
+# --- API Key：優先讀環境變數，備援讀 .env 檔 ---
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '..', '..', '.env'))
 _api_key = os.environ.get("GOOGLE_API_KEY")
 if not _api_key:
-    raise EnvironmentError(
-        "請設定環境變數 GOOGLE_API_KEY（不要寫進程式碼）\n"
-        "  方式 A: echo 'export GOOGLE_API_KEY=\"your_key\"' >> ~/.bashrc && source ~/.bashrc\n"
-        "  方式 B: echo 'GOOGLE_API_KEY=your_key' > /home/weilun/handeye_ws/.env"
-    )
-genai.configure(api_key=_api_key)
+    raise EnvironmentError("找不到 GOOGLE_API_KEY，請確認 handeye_ws/.env 存在")
+_genai_client = genai.Client(api_key=_api_key)
 
 # --- UR3 單臂 Gemini Prompt ---
 UR3_SINGLE_ARM_PROMPT = """
@@ -193,7 +191,7 @@ class SemanticBrainNode:
         self.sam_processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
 
         # Gemini VLM for grid analysis
-        self.gemini_model = genai.GenerativeModel('gemini-flash-latest')
+        self.gemini_model = _genai_client
 
         rospy.loginfo("All AI models loaded.")
 
@@ -306,17 +304,19 @@ class SemanticBrainNode:
             rospy.loginfo("[3/4] Gemini analyzing grid...")
             gemini_local_img = PILImage.open(grid_img_path)
 
-            try:
-                token_info = self.gemini_model.count_tokens(
-                    [UR3_SINGLE_ARM_PROMPT, img_pil, gemini_local_img]
-                )
-                rospy.loginfo(f"   Token estimate: {token_info.total_tokens}")
-            except Exception as e:
-                rospy.logwarn(f"   Cannot count tokens: {e}")
-
-            response = self.gemini_model.generate_content(
-                [UR3_SINGLE_ARM_PROMPT, img_pil, gemini_local_img]
-            )
+            for model_id in ['gemini-flash-latest', 'gemini-2.5-flash-lite']:
+                try:
+                    response = self.gemini_model.models.generate_content(
+                        model=model_id,
+                        contents=[UR3_SINGLE_ARM_PROMPT, img_pil, gemini_local_img]
+                    )
+                    rospy.loginfo(f"   Model: {model_id}")
+                    break
+                except Exception as e:
+                    if '503' in str(e) or 'UNAVAILABLE' in str(e):
+                        rospy.logwarn(f"   {model_id} 過載，切換備用...")
+                        continue
+                    raise
 
             clean_json = response.text.replace("```json", "").replace("```", "").strip()
             vlm_result = json.loads(clean_json)
