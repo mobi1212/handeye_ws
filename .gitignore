@@ -29,3 +29,14 @@ __pycache__/
 *.onnx
 runs/
 
+# API keys & secrets — NEVER commit these
+.env
+.env.*
+config/secrets.yaml
+config/api_keys.yaml
+*_api_key.txt
+*_api_key.yaml
+google_api_key*
+gemini_api_key*
+secrets/
+
