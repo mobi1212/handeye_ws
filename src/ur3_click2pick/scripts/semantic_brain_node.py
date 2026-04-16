@@ -195,9 +195,14 @@ class SemanticBrainNode:
 
         rospy.loginfo("All AI models loaded.")
 
-        # 輸出目錄
+        # 輸出目錄：/tmp 供程式讀取，workspace 根目錄供紀錄
         self.save_dir = "/tmp/semantic_brain"
+        self.log_base_dir = os.path.join(
+            os.path.dirname(__file__), '..', '..', '..', 'vlm_logs'
+        )
         os.makedirs(self.save_dir, exist_ok=True)
+        os.makedirs(self.log_base_dir, exist_ok=True)
+        self.session_log_dir = None  # 每次處理時建立
 
         self.target_object = ""
         self.need_process = False
@@ -243,17 +248,39 @@ class SemanticBrainNode:
                 self.is_processing = False
             rate.sleep()
 
+    def _log_save(self, filename, img_bgr):
+        """同時存到 /tmp 和 vlm_logs 時間戳資料夾"""
+        cv2.imwrite(os.path.join(self.save_dir, filename), img_bgr)
+        if self.session_log_dir:
+            cv2.imwrite(os.path.join(self.session_log_dir, filename), img_bgr)
+
     def process(self, img_msg, object_name):
         rospy.loginfo(f"[1/4] OWL-v2 detecting '{object_name}'...")
         try:
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_name = object_name.replace(" ", "_")
+            self.session_log_dir = os.path.join(
+                self.log_base_dir, f"{timestamp}_{safe_name}"
+            )
+            os.makedirs(self.session_log_dir, exist_ok=True)
+
+            # 只保留最近 10 次紀錄，超過從最舊的開始刪除
+            import shutil
+            existing = sorted([
+                d for d in os.listdir(self.log_base_dir)
+                if os.path.isdir(os.path.join(self.log_base_dir, d))
+            ])
+            while len(existing) > 10:
+                shutil.rmtree(os.path.join(self.log_base_dir, existing.pop(0)))
+
+            rospy.loginfo(f"   Log dir: {self.session_log_dir}")
+
             img_np = imgmsg_to_numpy(img_msg)
             h, w = img_np.shape[:2]
             img_pil = PILImage.fromarray(img_np)
 
-            cv2.imwrite(
-                os.path.join(self.save_dir, "original_rgb.png"),
-                cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-            )
+            self._log_save("original_rgb.png", cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR))
 
             # --- OWL-v2 偵測 ---
             preds = self.detector(img_pil, candidate_labels=[object_name])
@@ -280,10 +307,7 @@ class SemanticBrainNode:
             c_ymax = min(h, y_max + pad)
             cropped_img = img_np[c_ymin:c_ymax, c_xmin:c_xmax].copy()
 
-            cv2.imwrite(
-                os.path.join(self.save_dir, "object_crop_raw.png"),
-                cv2.cvtColor(cropped_img, cv2.COLOR_RGB2BGR)
-            )
+            self._log_save("object_crop_raw.png", cv2.cvtColor(cropped_img, cv2.COLOR_RGB2BGR))
 
             # --- SoM 網格 ---
             rospy.loginfo("[2/4] Drawing Set-of-Mark grid...")
@@ -297,8 +321,9 @@ class SemanticBrainNode:
                     c_xmin + lx2, c_ymin + ly2
                 ]
 
+            grid_img_bgr = cv2.cvtColor(grid_img_rgb, cv2.COLOR_RGB2BGR)
+            self._log_save("cropped_grid_for_vlm.png", grid_img_bgr)
             grid_img_path = os.path.join(self.save_dir, "cropped_grid_for_vlm.png")
-            cv2.imwrite(grid_img_path, cv2.cvtColor(grid_img_rgb, cv2.COLOR_RGB2BGR))
 
             # --- Gemini 推理 ---
             rospy.loginfo("[3/4] Gemini analyzing grid...")
@@ -350,10 +375,7 @@ class SemanticBrainNode:
             )
             global_mask = masks[0][0][0].numpy()
 
-            cv2.imwrite(
-                os.path.join(self.save_dir, "sam_global_mask_full.png"),
-                (global_mask * 255).astype(np.uint8)
-            )
+            self._log_save("sam_global_mask_full.png", (global_mask * 255).astype(np.uint8))
 
             # --- 合成最終 mask（只保留 target_grids 區域內的 SAM mask）---
             final_mask = np.zeros_like(global_mask, dtype=bool)
@@ -364,9 +386,27 @@ class SemanticBrainNode:
                 gx1, gy1, gx2, gy2 = grid_dict_absolute[grid_id]
                 final_mask[gy1:gy2, gx1:gx2] |= global_mask[gy1:gy2, gx1:gx2]
 
-            out_path = os.path.join(self.save_dir, "target_mask.png")
-            cv2.imwrite(out_path, (final_mask * 255).astype(np.uint8))
-            rospy.loginfo(f"   Mask saved: {out_path}")
+            self._log_save("target_mask.png", (final_mask * 255).astype(np.uint8))
+
+            # 同時存一張彩色視覺化：在原圖上疊加最終遮罩
+            overlay = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR).copy()
+            mask_colored = np.zeros_like(overlay)
+            mask_colored[final_mask] = (0, 255, 100)
+            overlay = cv2.addWeighted(overlay, 0.7, mask_colored, 0.3, 0)
+            for grid_id in target_grids:
+                if grid_id in grid_dict_absolute:
+                    gx1, gy1, gx2, gy2 = grid_dict_absolute[grid_id]
+                    cv2.rectangle(overlay, (gx1, gy1), (gx2, gy2), (0, 255, 255), 2)
+                    cv2.putText(overlay, grid_id, (gx1 + 4, gy1 + 18),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            self._log_save("result_overlay.png", overlay)
+
+            rospy.loginfo(f"   Logs saved: {self.session_log_dir}")
+
+            # 存 Gemini 推理結果 JSON
+            if self.session_log_dir:
+                with open(os.path.join(self.session_log_dir, "gemini_result.json"), 'w', encoding='utf-8') as f:
+                    json.dump(vlm_result, f, ensure_ascii=False, indent=2)
 
             rospy.loginfo("Processing complete!")
             self.done_pub.publish(json.dumps({
