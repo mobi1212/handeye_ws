@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import sys
+import os
+import json
 import rospy
 import numpy as np
 import cv2
@@ -11,6 +13,7 @@ import pickle
 import moveit_commander
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import String
 from cv_bridge import CvBridge, CvBridgeError
 from tf.transformations import quaternion_from_matrix
 from ultralytics import YOLO
@@ -50,7 +53,14 @@ class AnyGraspROSClient:
         # 暫存區
         self.cv_color = None
         self.cv_depth = None
-        self.manual_bbox = None # 🆕 用於儲存手動框選的 Bbox
+        self.manual_bbox = None
+
+        # --- 4. VLM+SAM 模式（brain node 整合）---
+        self.vlm_target = None       # 使用者輸入的目標物名稱
+        self.brain_result = None     # brain node 回傳結果
+        self.vlm_mask_path = "/tmp/semantic_brain/target_mask.png"
+        self.brain_trigger_pub = rospy.Publisher("/system/trigger_llm", String, queue_size=1)
+        rospy.Subscriber("/system/llm_done", String, self._brain_done_callback)
 
         # --- 相機內參 (從 /camera/color/camera_info 動態取得) ---
         self.fx = None
@@ -65,10 +75,26 @@ class AnyGraspROSClient:
         print("✅ ROS 節點已啟動，等待影像輸入...")
         print("-" * 50)
         print("👉 [s] : 發送目前偵測目標")
-        print("👉 [r] : ⚠️ YOLO 偵測不到時，按此鍵手動框選物體")
-        print("👉 [c] : 清除手動框選，回到 YOLO 自動偵測")
+        print("👉 [v] : VLM+SAM 模式：輸入文字描述目標物")
+        print("👉 [r] : YOLO 偵測不到時，手動框選物體")
+        print("👉 [c] : 清除所有模式，回到 YOLO 自動偵測")
         print("👉 [q] : 退出程式")
         print("-" * 50)
+
+    def _brain_done_callback(self, msg):
+        """收到 brain node 處理完成的訊號"""
+        try:
+            self.brain_result = json.loads(msg.data)
+            status = self.brain_result.get("status", "unknown")
+            if status == "done":
+                grids = self.brain_result.get("target_grids", [])
+                print(f"\n✅ Brain node 完成！抓取格子: {grids}")
+                print("   按 [s] 發送至 AnyGrasp Server")
+            else:
+                reason = self.brain_result.get("reason", "unknown")
+                print(f"\n❌ Brain node 失敗: {reason}")
+        except json.JSONDecodeError:
+            print(f"\n❌ Brain node 回傳格式錯誤: {msg.data}")
 
     def camera_info_callback(self, msg):
         if self.fx is None:  # 只需取一次
@@ -121,7 +147,38 @@ class AnyGraspROSClient:
                 best_mask = None # 手動模式不提供 Mask
                 cls_name = "manual_item"
             
-            # --- 優先權 2：YOLO 自動偵測模式 ---
+            # --- 優先權 2：VLM+SAM 模式 ---
+            elif self.vlm_target and self.brain_result and self.brain_result.get("status") == "done":
+                # 讀取 brain node 產生的 mask
+                if os.path.exists(self.vlm_mask_path):
+                    mask_img = cv2.imread(self.vlm_mask_path, cv2.IMREAD_GRAYSCALE)
+                    if mask_img is not None:
+                        best_mask = (mask_img > 127).astype(np.float32)
+                        ys, xs = np.where(mask_img > 127)
+                        if len(xs) > 0:
+                            x1, y1 = int(xs.min()), int(ys.min())
+                            x2, y2 = int(xs.max()), int(ys.max())
+                            best_bbox = [x1, y1, x2, y2]
+                            cls_name = self.vlm_target
+                            cv2.rectangle(display_img, (x1, y1), (x2, y2), (0, 255, 255), 3)
+                            cv2.putText(display_img, f"VLM: {cls_name}",
+                                        (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                        else:
+                            best_bbox, best_mask, cls_name = None, None, "None"
+                    else:
+                        best_bbox, best_mask, cls_name = None, None, "None"
+                else:
+                    best_bbox, best_mask, cls_name = None, None, "None"
+                    cv2.putText(display_img, f"VLM: waiting for mask...",
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+            # --- 優先權 2.5：VLM 模式等待中 ---
+            elif self.vlm_target and (self.brain_result is None or self.brain_result.get("status") not in ("done", "fail")):
+                best_bbox, best_mask, cls_name = None, None, "None"
+                cv2.putText(display_img, f"VLM: processing '{self.vlm_target}'...",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+
+            # --- 優先權 3：YOLO 自動偵測模式 ---
             else:
                 results = self.yolo_model(display_img, verbose=False, conf=0.2)
                 boxes = results[0].boxes
@@ -145,7 +202,18 @@ class AnyGraspROSClient:
             if key & 0xFF == ord('q'):
                 break
             
-            # 🆕 [r] 觸發手動框選 (OpenCV 內建選擇器)
+            # [v] 觸發 VLM+SAM 模式
+            if key & 0xFF == ord('v'):
+                prompt = input("\n🔍 請輸入目標物件（英文，例如：bottle）：").strip()
+                if prompt:
+                    self.vlm_target = prompt
+                    self.brain_result = None
+                    self.manual_bbox = None
+                    payload = json.dumps({"object_name": prompt})
+                    self.brain_trigger_pub.publish(payload)
+                    print(f"⚡ 已發送 trigger，等待 brain node 處理 '{prompt}'...")
+
+            # [r] 觸發手動框選 (OpenCV 內建選擇器)
             if key & 0xFF == ord('r'):
                 print("\n🖱️ 請在彈出的視窗中框選物體，完成按 [Enter]，取消按 [c]")
                 roi = cv2.selectROI("Select Target", self.cv_color, fromCenter=False, showCrosshair=True)
@@ -155,9 +223,11 @@ class AnyGraspROSClient:
                     self.manual_bbox = [x, y, x+w, y+h]
                     print(f"✅ 已鎖定手動範圍: {self.manual_bbox}")
 
-            # 🆕 [c] 清除手動模式，回到自動偵測
+            # [c] 清除所有模式，回到 YOLO 自動偵測
             if key & 0xFF == ord('c'):
                 self.manual_bbox = None
+                self.vlm_target = None
+                self.brain_result = None
                 print("🔄 已切換回 YOLO 自動偵測模式。")
 
             # --- 當按下 [s] 發送時 ---
