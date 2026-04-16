@@ -145,7 +145,8 @@ class AnyGraspROSClient:
                 continue
 
             display_img = self.cv_color.copy()
-            
+            svd_mask = None  # VLM 模式專用：整個物體遮罩（供 SVD 桌面擬合用）
+
             # --- 優先權 1：手動框選模式 ---
             if self.manual_bbox is not None:
                 x1, y1, x2, y2 = self.manual_bbox
@@ -158,7 +159,8 @@ class AnyGraspROSClient:
             
             # --- 優先權 2：VLM+SAM 模式 ---
             elif self.vlm_target and self.brain_result and self.brain_result.get("status") == "done":
-                # 讀取 brain node 產生的 mask
+                # target_mask.png：Gemini 選定格子的遮罩（決定 bbox 與 AnyGrasp 輸入範圍）
+                # sam_global_mask_full.png：整個物體的 SAM 遮罩（供 SVD 桌面擬合用）
                 if os.path.exists(self.vlm_mask_path):
                     mask_img = cv2.imread(self.vlm_mask_path, cv2.IMREAD_GRAYSCALE)
                     if mask_img is not None:
@@ -180,6 +182,13 @@ class AnyGraspROSClient:
                     best_bbox, best_mask, cls_name = None, None, "None"
                     cv2.putText(display_img, f"VLM: waiting for mask...",
                                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+                # 讀取完整物體遮罩供 SVD 使用
+                full_mask_path = "/tmp/semantic_brain/sam_global_mask_full.png"
+                if os.path.exists(full_mask_path):
+                    full_mask_img = cv2.imread(full_mask_path, cv2.IMREAD_GRAYSCALE)
+                    if full_mask_img is not None:
+                        svd_mask = (full_mask_img > 127).astype(np.float32)
 
             # --- 優先權 2.5：VLM 模式等待中 ---
             elif self.vlm_target and (self.brain_result is None or self.brain_result.get("status") not in ("done", "fail")):
@@ -250,12 +259,17 @@ class AnyGraspROSClient:
                     continue
 
                 # 如果沒有 Mask (手動模式)，就直接用原始深度圖發送
-                if best_mask is None:
+                # VLM 模式：svd_mask = 整個物體遮罩（甜甜圈更準確）；其他模式 svd_mask=None 則 fallback 用 best_mask
+                mask_for_svd = svd_mask if svd_mask is not None else best_mask
+                if mask_for_svd is None:
                     print("🛠️ 使用 Bbox 區域發送 (無 Mask 模式)...")
                     clean_depth = self.cv_depth
                 else:
-                    print("🎯 啟動 SVD 桌面擬合去背...")
-                    mask_resized = cv2.resize(best_mask, (self.cv_depth.shape[1], self.cv_depth.shape[0]))
+                    if svd_mask is not None:
+                        print("🎯 啟動 SVD 桌面擬合去背（使用完整物體遮罩）...")
+                    else:
+                        print("🎯 啟動 SVD 桌面擬合去背...")
+                    mask_resized = cv2.resize(mask_for_svd, (self.cv_depth.shape[1], self.cv_depth.shape[0]))
                     obj_mask = (mask_resized > 0.5).astype(np.uint8)
 
                     # fx, fy = 617.183, 617.122  # 原本硬編碼
