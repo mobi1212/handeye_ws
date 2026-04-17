@@ -77,11 +77,21 @@ Y1 是物件頂部，Y5 是物件底部靠近桌面。
 約束四：從【圖片 1】判斷手臂可達性
 觀察物件在桌面的實際位置，選擇 UR3 手臂容易到達的區域。
 
+約束五：質心與抓取性平衡
+根據你對目標物件的知識，推估其質心位置，但抓取點必須同時滿足「靠近質心」與「表面可抓取」兩個條件。
+- 目標是選「最靠近質心的可抓取表面」，而非直接夾在質心位置
+- 光滑金屬平面（如鎚頭側面、刀身）、圓弧面（如杯底）摩擦係數低，即使靠近質心也應避免
+- 有紋路、有包覆或截面為圓柱形的表面（如把柄、握把）摩擦係數高，優先選擇
+- 具體例子：鎚子應夾「把柄靠近鎚頭的頸部段」，絕對不可選鎚頭本體（光滑金屬，必滑落）；螺絲起子應夾握柄而非金屬桿
+- 重量分佈均勻的物體（積木、書本）直接選幾何中心附近即可
+- 若視覺難以判斷材質，以密度估算質心：金屬 > 陶瓷/玻璃 > 木頭/塑膠
+
 【輸出格式】（純 JSON，不含其他文字）
 {
     "object_name": "物件英文名稱",
+    "estimated_com_grid": "估計質心所在格子代號",
     "target_grids": ["網格代號", ...],
-    "reasoning": "說明你如何根據上述約束做出這個選擇"
+    "reasoning": "說明質心估計依據，以及如何根據上述約束做出這個選擇"
 }
 """
 
@@ -347,6 +357,8 @@ class SemanticBrainNode:
             vlm_result = json.loads(clean_json)
 
             target_grids = vlm_result.get('target_grids', [])
+            com_grid     = vlm_result.get('estimated_com_grid', 'N/A')
+            rospy.loginfo(f"   Estimated CoM grid:  {com_grid}")
             rospy.loginfo(f"   Gemini selected grids: {target_grids}")
             rospy.loginfo(f"   Reasoning: {vlm_result.get('reasoning', '')}")
 
