@@ -70,18 +70,22 @@ Y1 是物件頂部，Y5 是物件底部靠近桌面。
 - Y4：可以使用，手臂需要稍微向下延伸，但仍在合理範圍內
 - Y5：盡量避免，非常靠近桌面，手臂難以到達且容易碰撞桌面
 
-約束二：抓取區域需連續且集中
+約束二：物件覆蓋率
+網格圖上疊加了物件的紫色輪廓線，只選擇物件實際佔據面積較大的格子。
+若某格子內幾乎沒有物件（大部分是背景），不應選擇。
+
+約束三：抓取區域需連續且集中
 選擇的網格應彼此相鄰，形成有效的夾取面。
 至少選擇 2 個相鄰網格，單一網格夾取面積不足。
 
-約束三：穩定性
+約束四：穩定性
 選擇物件較寬或較厚的部位，避免邊角或細薄處。
 考慮平行夾爪的夾取方向（左右對稱為佳）。
 
-約束四：從【圖片 1】判斷手臂可達性
+約束五：從【圖片 1】判斷手臂可達性
 觀察物件在桌面的實際位置，選擇 UR3 手臂容易到達的區域。
 
-約束五：質心與抓取性平衡
+約束六：質心與抓取性平衡
 根據你對目標物件的知識，推估其質心位置，但抓取點必須同時滿足「靠近質心」與「表面可抓取」兩個條件。
 - 目標是選「最靠近質心的可抓取表面」，而非直接夾在質心位置
 - 光滑金屬平面（如鎚頭側面、刀身）、圓弧面（如杯底）摩擦係數低，即使靠近質心也應避免
@@ -286,7 +290,7 @@ class SemanticBrainNode:
                 d for d in os.listdir(self.log_base_dir)
                 if os.path.isdir(os.path.join(self.log_base_dir, d))
             ])
-            while len(existing) > 10:
+            while len(existing) > 50:
                 shutil.rmtree(os.path.join(self.log_base_dir, existing.pop(0)))
 
             rospy.loginfo(f"   Log dir: {self.session_log_dir}")
@@ -314,6 +318,26 @@ class SemanticBrainNode:
             y_max = int(box['ymax'])
             rospy.loginfo(f"   Detected '{object_name}', confidence: {best_pred['score']:.2f}")
 
+            # --- SAM v1 分割（提前到 Gemini 之前）---
+            rospy.loginfo("[2/5] SAM segmentation...")
+            inputs = self.sam_processor(
+                img_pil,
+                input_boxes=[[[x_min, y_min, x_max, y_max]]],
+                return_tensors="pt"
+            ).to(self.device)
+
+            with torch.no_grad():
+                outputs = self.sam_model(**inputs)
+
+            masks = self.sam_processor.image_processor.post_process_masks(
+                outputs.pred_masks.cpu(),
+                inputs.original_sizes.cpu(),
+                inputs.reshaped_input_sizes.cpu()
+            )
+            global_mask = masks[0][0][0].numpy()
+
+            self._log_save("sam_global_mask_full.png", (global_mask * 255).astype(np.uint8))
+
             # --- 裁切物件區域 ---
             pad = 20
             c_xmin = max(0, x_min - pad)
@@ -324,11 +348,16 @@ class SemanticBrainNode:
 
             self._log_save("object_crop_raw.png", cv2.cvtColor(cropped_img, cv2.COLOR_RGB2BGR))
 
-            # --- SoM 網格 ---
-            rospy.loginfo("[2/4] Drawing Set-of-Mark grid...")
+            # --- SoM 網格 + SAM 輪廓疊加 ---
+            rospy.loginfo("[3/5] Drawing Set-of-Mark grid with SAM contour...")
             grid_img_rgb, grid_dict_local = draw_som_grid(cropped_img, rows=5, cols=5)
 
-            # 轉換為全圖絕對座標（給 SAM 使用）
+            # 在格子圖上疊加 SAM mask 的輪廓線，讓 Gemini 看到物件邊界
+            cropped_mask = global_mask[c_ymin:c_ymax, c_xmin:c_xmax].astype(np.uint8)
+            contours, _ = cv2.findContours(cropped_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(grid_img_rgb, contours, -1, (180, 0, 255), 2)  # 紫色輪廓
+
+            # 轉換為全圖絕對座標
             grid_dict_absolute = {}
             for grid_id, (lx1, ly1, lx2, ly2) in grid_dict_local.items():
                 grid_dict_absolute[grid_id] = [
@@ -341,14 +370,14 @@ class SemanticBrainNode:
             grid_img_path = os.path.join(self.save_dir, "cropped_grid_for_vlm.png")
 
             # --- Gemini 推理 ---
-            rospy.loginfo("[3/4] Gemini analyzing grid...")
+            rospy.loginfo("[4/5] Gemini analyzing grid...")
             gemini_local_img = PILImage.open(grid_img_path)
 
             n_clients = len(self.gemini_clients)
             response = None
             for attempt in range(n_clients * 2):  # 最多嘗試每個 key 兩次
                 client = self.gemini_clients[self.gemini_key_idx]
-                model_id = 'gemini-2.5-flash-preview-04-17'
+                model_id = 'gemini-2.5-flash-lite'
                 try:
                     response = client.models.generate_content(
                         model=model_id,
@@ -382,31 +411,34 @@ class SemanticBrainNode:
                 }))
                 return
 
-            # --- SAM v1 分割 ---
-            rospy.loginfo("[4/4] SAM segmentation...")
-            inputs = self.sam_processor(
-                img_pil,
-                input_boxes=[[[x_min, y_min, x_max, y_max]]],
-                return_tensors="pt"
-            ).to(self.device)
+            # --- [5/5] 覆蓋率後處理：踢掉物件占比 < 20% 的格子 ---
+            rospy.loginfo("[5/5] Coverage validation...")
+            min_coverage = 0.20
+            validated_grids = []
+            for grid_id in target_grids:
+                if grid_id not in grid_dict_absolute:
+                    rospy.logwarn(f"   Unknown grid id: {grid_id}")
+                    continue
+                gx1, gy1, gx2, gy2 = grid_dict_absolute[grid_id]
+                cell_area = (gx2 - gx1) * (gy2 - gy1)
+                obj_pixels = global_mask[gy1:gy2, gx1:gx2].sum()
+                coverage = obj_pixels / cell_area if cell_area > 0 else 0
+                rospy.loginfo(f"   {grid_id}: coverage = {coverage:.1%}")
+                if coverage >= min_coverage:
+                    validated_grids.append(grid_id)
+                else:
+                    rospy.logwarn(f"   {grid_id} 覆蓋率不足 ({coverage:.1%} < {min_coverage:.0%})，已排除")
 
-            with torch.no_grad():
-                outputs = self.sam_model(**inputs)
+            if not validated_grids:
+                rospy.logwarn("所有格子覆蓋率不足，使用 Gemini 原始選擇")
+                validated_grids = target_grids
 
-            masks = self.sam_processor.image_processor.post_process_masks(
-                outputs.pred_masks.cpu(),
-                inputs.original_sizes.cpu(),
-                inputs.reshaped_input_sizes.cpu()
-            )
-            global_mask = masks[0][0][0].numpy()
-
-            self._log_save("sam_global_mask_full.png", (global_mask * 255).astype(np.uint8))
+            target_grids = validated_grids
 
             # --- 合成最終 mask（只保留 target_grids 區域內的 SAM mask）---
             final_mask = np.zeros_like(global_mask, dtype=bool)
             for grid_id in target_grids:
                 if grid_id not in grid_dict_absolute:
-                    rospy.logwarn(f"   Unknown grid id: {grid_id}")
                     continue
                 gx1, gy1, gx2, gy2 = grid_dict_absolute[grid_id]
                 final_mask[gy1:gy2, gx1:gx2] |= global_mask[gy1:gy2, gx1:gx2]

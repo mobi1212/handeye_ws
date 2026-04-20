@@ -1,7 +1,7 @@
 <package format="2">
-  <name>ur3_click2pick</name>
-  <version>0.0.1</version>
-  <description>OpenCV click-to-pick for UR3 with tf2 and MoveIt</description>
+  <name>ur3_handover</name>
+  <version>0.1.0</version>
+  <description>UR3 semantic grasping and human handover system with VLM+SAM+AnyGrasp</description>
   <maintainer email="you@example.com">you</maintainer>
   <license>BSD</license>
 

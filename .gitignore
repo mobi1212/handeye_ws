@@ -40,3 +40,4 @@ google_api_key*
 gemini_api_key*
 secrets/
 
+vlm_logs/

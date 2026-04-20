@@ -13,7 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | 3 | MoveIt | `roslaunch ur3_moveit_config moveit_planning_execution.launch limited:=true` |
 | 4 | TF 外參 | `roslaunch easy_handeye publish.launch eye_on_hand:=false namespace_prefix:=ur3_realsense_handeyecalibration_eye_on_base robot_base_frame:=base_link tracking_base_frame:=camera_color_optical_frame calibration_file:=$HOME/.ros/easy_handeye/ur3_realsense_handeyecalibration_eye_on_base.yaml` |
 | 5 | AI 大腦（遠端） | `python3 server_anygrasp.py --debug` |
-| 6 | 機械臂控制器 | `rosrun ur3_click2pick semantic_grasp_controller.py` |
+| 6 | 機械臂控制器 | `rosrun ur3_handover semantic_grasp_controller.py` |
 | 7 | 視覺前端 | `python3 client_camera.py` |
 
 **前置確認**
@@ -29,7 +29,7 @@ cd /home/weilun/handeye_ws && catkin_make
 source /home/weilun/handeye_ws/devel/setup.bash
 
 # 傳統 Click-to-Pick 流程 (YOLO → 像素座標 → 機械臂)
-roslaunch ur3_click2pick click_to_pick_cv.launch
+roslaunch ur3_handover click_to_pick_cv.launch
 ```
 
 ## 整體架構
@@ -43,13 +43,13 @@ RealSense D435
     │  /camera/color/image_raw
     │  /camera/aligned_depth_to_color/image_raw
     ▼
-client_camera.py          (ur3_click2pick/scripts/)
+client_camera.py          (ur3_handover/scripts/)
   ├─ YOLO 物體偵測 (weights/best.pt)
   ├─ SVD 桌面擬合：填補物體遮蔽造成的深度空洞
   └─ ZMQ REQ → 遠端 AnyGrasp Server (Ngrok TCP)
                               │ 回傳 6D 抓取姿態
     ▼  ROS topic: /anygrasp/target_pose (PoseStamped)
-semantic_grasp_controller.py  (ur3_click2pick/scripts/)
+semantic_grasp_controller.py  (ur3_handover/scripts/)
   ├─ TF 轉換：camera_color_optical_frame → base_link
   ├─ 姿態對齊：AnyGrasp X 軸旋轉 Y -90° → UR3 Z 軸
   ├─ 安全鎖：互動式 input() 確認後才執行
