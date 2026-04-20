@@ -39,10 +39,14 @@ warnings.filterwarnings('ignore')
 # --- API Key：優先讀環境變數，備援讀 .env 檔 ---
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '..', '..', '.env'))
-_api_key = os.environ.get("GOOGLE_API_KEY")
-if not _api_key:
+_api_keys = [k for k in [
+    os.environ.get("GOOGLE_API_KEY"),
+    os.environ.get("GOOGLE_API_KEY_2"),
+] if k]
+if not _api_keys:
     raise EnvironmentError("找不到 GOOGLE_API_KEY，請確認 handeye_ws/.env 存在")
-_genai_client = genai.Client(api_key=_api_key)
+_genai_clients = [genai.Client(api_key=k) for k in _api_keys]
+_client_index  = 0  # 目前使用的 client 索引
 
 # --- UR3 單臂 Gemini Prompt ---
 UR3_SINGLE_ARM_PROMPT = """
@@ -200,8 +204,9 @@ class SemanticBrainNode:
         self.sam_model = SamModel.from_pretrained("facebook/sam-vit-base").to(self.device)
         self.sam_processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
 
-        # Gemini VLM for grid analysis
-        self.gemini_model = _genai_client
+        # Gemini VLM for grid analysis（round-robin 多 key）
+        self.gemini_clients = _genai_clients
+        self.gemini_key_idx = 0
 
         rospy.loginfo("All AI models loaded.")
 
@@ -339,19 +344,27 @@ class SemanticBrainNode:
             rospy.loginfo("[3/4] Gemini analyzing grid...")
             gemini_local_img = PILImage.open(grid_img_path)
 
-            for model_id in ['gemini-flash-latest', 'gemini-2.5-flash-lite']:
+            n_clients = len(self.gemini_clients)
+            response = None
+            for attempt in range(n_clients * 2):  # 最多嘗試每個 key 兩次
+                client = self.gemini_clients[self.gemini_key_idx]
+                model_id = 'gemini-2.5-flash-preview-04-17'
                 try:
-                    response = self.gemini_model.models.generate_content(
+                    response = client.models.generate_content(
                         model=model_id,
                         contents=[UR3_SINGLE_ARM_PROMPT, img_pil, gemini_local_img]
                     )
-                    rospy.loginfo(f"   Model: {model_id}")
+                    rospy.loginfo(f"   Model: {model_id}, Key index: {self.gemini_key_idx}")
                     break
                 except Exception as e:
-                    if '503' in str(e) or 'UNAVAILABLE' in str(e):
-                        rospy.logwarn(f"   {model_id} 過載，切換備用...")
+                    err = str(e)
+                    if any(c in err for c in ['429', 'RESOURCE_EXHAUSTED', '503', 'UNAVAILABLE']):
+                        rospy.logwarn(f"   Key {self.gemini_key_idx} 配額/過載，切換下一個...")
+                        self.gemini_key_idx = (self.gemini_key_idx + 1) % n_clients
                         continue
                     raise
+            if response is None:
+                raise RuntimeError("所有 Gemini API key 均無法使用")
 
             clean_json = response.text.replace("```json", "").replace("```", "").strip()
             vlm_result = json.loads(clean_json)
