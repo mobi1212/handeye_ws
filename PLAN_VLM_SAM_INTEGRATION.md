@@ -1,7 +1,7 @@
 # 系統架構與 VLM+SAM 整合計劃書
 
-**版本**: v4.0
-**更新日期**: 2026-04-20
+**版本**: v5.0
+**更新日期**: 2026-04-22
 **狀態**: 實體手臂整合完成，持續優化中
 
 ---
@@ -162,12 +162,53 @@ camera_color_optical_frame → ...        （RealSense 內部，publish_tf=false
 | OWL-v2 + SAM + Gemini 整合 | ✅ | brain_node.py 運作正常 |
 | SAM 提前 + 覆蓋率驗證 | ✅ | 防止 Gemini 選到空格子 |
 | TF loop 修正 | ✅ | Cartesian 路徑規劃恢復正常 |
-| 雙 API key round-robin | ✅ | 配額耗盡自動切換 |
+| 雙 API key round-robin | ✅ | 最多三個 key，配額耗盡自動切換 |
 | 關節超出界限自動 normalize | ✅ | wrist_3 > 2π 不再卡住 |
 | 抓取後垂直抬升 | ✅ | Z+0.05m 取代沿抓取軸後退 |
+| 套件改名 ur3_click2pick → ur3_handover | ✅ | 反映最終 human handover 目標 |
+| tmux 一鍵啟動腳本 | ✅ | start_grasp.sh / start_calibration.sh |
+| 目標區域點雲密度增加 | ✅ | server_anygrasp.py，深度圖插值 2x，見下方說明 |
 | AnyGrasp 受 mask 約束 | ⬜ | 目前只傳 bbox，AnyGrasp 可能選到 mask 外 |
+| VLM pipeline 移至遠端 server | ⬜ | 計劃書：SERVER_UPGRADE_PLAN.md，待桌機端實作 |
 | 格子更細 | ⬜ | 目前 5×5，可視表現再評估是否改 7×7 |
 
 ---
 
-*v4.0 — 實體手臂整合完成版*
+## 5. 點雲密度增加說明（2026-04-22）
+
+### 背景
+AnyGrasp 對桌面物體有時生成過於傾斜的抓取姿態（45-60°）。
+討論過的方向（接近角過濾、CoM 加權、修改幾何）均有侷限：
+- 接近角過濾依賴桌面法向量，水杯等需側面抓取的物體會誤殺
+- 修改輸入幾何會讓 AnyGrasp 基於假幾何計算夾爪深度和寬度，不可靠
+- 增加點雲密度不直接減少傾斜，但增加目標區域候選數量，提升選到好姿態的機率
+
+### 做法（深度圖插值法）
+在 `server_anygrasp.py` 點雲建立後、AnyGrasp 推論前：
+1. 取 bbox 範圍內的深度圖和 RGB
+2. 用 `INTER_LINEAR` 插值放大 `UPSAMPLE` 倍（預設 2x）
+3. 用 sub-pixel 座標反投影到 3D（座標：`bx1 + u'/UPSAMPLE`）
+4. 新點疊加在原有點雲上，原點保留
+
+### 抓取姿態傾斜問題的根本結論
+- 修改 AnyGrasp 輸入讓它「考慮重量分佈」不實際，需重新訓練模型才能真正理解物理資訊
+- CoM 加權（用 Gemini 的 `estimated_com_grid` 反投影 3D）可作為後處理評分，未來可加
+
+---
+
+## 6. 架構演進方向
+
+```
+現況（pick-and-place）
+  桌面物體 → AnyGrasp 抓取 → 固定座標放置
+
+近期目標
+  server_anygrasp.py 整合 VLM pipeline（見 SERVER_UPGRADE_PLAN.md）
+
+長期目標（human handover）
+  偵測人手位置 → 動態計算交接點 → 交接姿態調整 → 感知人手接取後放開
+```
+
+---
+
+*v5.0 — 2026-04-22，點雲密度增加 + 架構演進記錄*
