@@ -20,7 +20,7 @@ import os
 ros_path = '/opt/ros/noetic/lib/python3/dist-packages'
 if ros_path in sys.path:
     sys.path.remove(ros_path)
-sys.path.append(ros_path)
+sys.path.insert(0, ros_path)
 
 import cv2
 import json
@@ -42,6 +42,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), '..', '..', '..', '.env'))
 _api_keys = [k for k in [
     os.environ.get("GOOGLE_API_KEY"),
     os.environ.get("GOOGLE_API_KEY_2"),
+    os.environ.get("GOOGLE_API_KEY_3"),
 ] if k]
 if not _api_keys:
     raise EnvironmentError("找不到 GOOGLE_API_KEY，請確認 handeye_ws/.env 存在")
@@ -52,10 +53,10 @@ _client_index  = 0  # 目前使用的 client 索引
 UR3_SINGLE_ARM_PROMPT = """
 你是一個機器人視覺分析專家，協助單臂 UR3 機械臂抓取物件。
 
-你將收到兩張圖片：
-【圖片 1】全局場景圖：顯示 UR3 機械臂基座位置、桌面高度，以及目標物件的擺放狀態。
-【圖片 2】物件特寫網格圖：目標物件的局部放大裁切圖，疊加了 5x5 網格（X 軸 A-E 由左到右，Y 軸 1-5 由上到下）。
+你將收到一張圖片：
+【物件特寫網格圖】目標物件的局部放大裁切圖，疊加了 5x5 網格（X 軸 A-E 由左到右，Y 軸 1-5 由上到下）。
 每個格子的中心都有白色標籤顯示其代號（如 A1、B2）。
+物件邊界以紫色輪廓線標示。
 
 【任務背景】
 UR3 機械臂從上方接近桌面物件進行抓取，夾爪為平行夾爪。
@@ -63,15 +64,15 @@ UR3 機械臂從上方接近桌面物件進行抓取，夾爪為平行夾爪。
 
 【約束條件】
 
-約束一：高度選擇原則
-Y1 是物件頂部，Y5 是物件底部靠近桌面。
-- Y1：物件頂部，適合較高物體的上方抓取
-- Y2、Y3：最佳抓取區間，手臂工作空間充裕，強烈推薦優先選擇
-- Y4：可以使用，手臂需要稍微向下延伸，但仍在合理範圍內
-- Y5：盡量避免，非常靠近桌面，手臂難以到達且容易碰撞桌面
+約束一：優先選擇適合夾爪穩定接觸的部位
+請優先選擇物體上「較容易被平行夾爪穩定夾住」的區域，而不是單純依照圖中高低位置選擇。
+- 優先選擇較厚、較穩、較容易形成夾持面的部位
+- 若物體有握持部位（如把柄、握把、中段），優先考慮該部位
+- 避免只因為位置較高就選頂端，或只因為靠近底部就完全排除
+- 但若區域非常靠近桌面、明顯會增加碰撞風險，仍應降低優先度
 
 約束二：物件覆蓋率
-網格圖上疊加了物件的紫色輪廓線，只選擇物件實際佔據面積較大的格子。
+只選擇物件實際佔據面積較大的格子（紫色輪廓線內）。
 若某格子內幾乎沒有物件（大部分是背景），不應選擇。
 
 約束三：抓取區域需連續且集中
@@ -82,10 +83,7 @@ Y1 是物件頂部，Y5 是物件底部靠近桌面。
 選擇物件較寬或較厚的部位，避免邊角或細薄處。
 考慮平行夾爪的夾取方向（左右對稱為佳）。
 
-約束五：從【圖片 1】判斷手臂可達性
-觀察物件在桌面的實際位置，選擇 UR3 手臂容易到達的區域。
-
-約束六：質心與抓取性平衡
+約束五：質心與抓取性平衡
 根據你對目標物件的知識，推估其質心位置，但抓取點必須同時滿足「靠近質心」與「表面可抓取」兩個條件。
 - 目標是選「最靠近質心的可抓取表面」，而非直接夾在質心位置
 - 光滑金屬平面（如鎚頭側面、刀身）、圓弧面（如杯底）摩擦係數低，即使靠近質心也應避免
@@ -93,6 +91,10 @@ Y1 是物件頂部，Y5 是物件底部靠近桌面。
 - 具體例子：鎚子應夾「把柄靠近鎚頭的頸部段」，絕對不可選鎚頭本體（光滑金屬，必滑落）；螺絲起子應夾握柄而非金屬桿
 - 重量分佈均勻的物體（積木、書本）直接選幾何中心附近即可
 - 若視覺難以判斷材質，以密度估算質心：金屬 > 陶瓷/玻璃 > 木頭/塑膠
+
+約束六：球體特殊規則
+若物件為球形（如球、橘子、蘋果），請選擇物件佔據面積 > 20% 的所有格子。
+球體沒有固定抓取方向，提供最大覆蓋範圍讓機器人自行選擇最佳接觸點。
 
 【輸出格式】（純 JSON，不含其他文字）
 {
@@ -274,7 +276,7 @@ class SemanticBrainNode:
             cv2.imwrite(os.path.join(self.session_log_dir, filename), img_bgr)
 
     def process(self, img_msg, object_name):
-        rospy.loginfo(f"[1/4] OWL-v2 detecting '{object_name}'...")
+        rospy.loginfo(f"[1/5] OWL-v2 detecting '{object_name}'...")
         try:
             import datetime
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -375,32 +377,49 @@ class SemanticBrainNode:
 
             n_clients = len(self.gemini_clients)
             response = None
-            for attempt in range(n_clients * 2):  # 最多嘗試每個 key 兩次
-                client = self.gemini_clients[self.gemini_key_idx]
-                model_id = 'gemini-2.5-flash-lite'
-                try:
-                    response = client.models.generate_content(
-                        model=model_id,
-                        contents=[UR3_SINGLE_ARM_PROMPT, img_pil, gemini_local_img]
-                    )
-                    rospy.loginfo(f"   Model: {model_id}, Key index: {self.gemini_key_idx}")
+            IS_RATE_LIMIT = lambda e: any(c in e for c in ['429', 'RESOURCE_EXHAUSTED'])
+            IS_SERVER_ERR = lambda e: any(c in e for c in ['503', 'UNAVAILABLE'])
+            for model_id in ['gemini-2.5-flash', 'gemini-2.5-flash-lite']:
+                for attempt in range(n_clients):
+                    client = self.gemini_clients[self.gemini_key_idx]
+                    try:
+                        response = client.models.generate_content(
+                            model=model_id,
+                            contents=[UR3_SINGLE_ARM_PROMPT, gemini_local_img]
+                        )
+                        usage = response.usage_metadata
+                        rospy.loginfo(
+                            f"   Model: {model_id}, Key: [{self.gemini_key_idx}] | "
+                            f"tokens — input: {usage.prompt_token_count}, "
+                            f"output: {usage.candidates_token_count}, "
+                            f"total: {usage.total_token_count}"
+                        )
+                        break
+                    except Exception as e:
+                        err = str(e)
+                        if IS_SERVER_ERR(err):
+                            rospy.logwarn(f"   ⚠️  {model_id} 伺服器過載 (503)，直接切換模型...")
+                            break  # 跳出 key loop，換下一個模型
+                        elif IS_RATE_LIMIT(err):
+                            next_idx = (self.gemini_key_idx + 1) % n_clients
+                            rospy.logwarn(f"   ⚠️  Key [{self.gemini_key_idx}] 限額 (429)，切換至 Key [{next_idx}]...")
+                            self.gemini_key_idx = next_idx
+                            continue
+                        raise
+                if response is not None:
                     break
-                except Exception as e:
-                    err = str(e)
-                    if any(c in err for c in ['429', 'RESOURCE_EXHAUSTED', '503', 'UNAVAILABLE']):
-                        rospy.logwarn(f"   Key {self.gemini_key_idx} 配額/過載，切換下一個...")
-                        self.gemini_key_idx = (self.gemini_key_idx + 1) % n_clients
-                        continue
-                    raise
+                rospy.logwarn(f"   🔄 {model_id} 無法使用，嘗試 fallback 模型...")
             if response is None:
-                raise RuntimeError("所有 Gemini API key 均無法使用")
+                raise RuntimeError("所有模型均無法使用，請稍後再試")
 
             clean_json = response.text.replace("```json", "").replace("```", "").strip()
             vlm_result = json.loads(clean_json)
 
             target_grids = vlm_result.get('target_grids', [])
             com_grid     = vlm_result.get('estimated_com_grid', 'N/A')
+            object_shape = vlm_result.get('object_shape', 'box')
             rospy.loginfo(f"   Estimated CoM grid:  {com_grid}")
+            rospy.loginfo(f"   Object shape: {object_shape}")
             rospy.loginfo(f"   Gemini selected grids: {target_grids}")
             rospy.loginfo(f"   Reasoning: {vlm_result.get('reasoning', '')}")
 
@@ -469,6 +488,7 @@ class SemanticBrainNode:
             self.done_pub.publish(json.dumps({
                 "status": "done",
                 "object_name": object_name,
+                "object_shape": object_shape,
                 "target_grids": target_grids,
                 "reasoning": vlm_result.get('reasoning', '')
             }))

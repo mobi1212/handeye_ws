@@ -13,6 +13,30 @@
 
 ---
 
+## 零、一鍵啟動腳本（推薦）
+
+工作區根目錄提供兩支 tmux 啟動腳本，自動分割 pane、啟動所有節點、配置 conda 環境：
+
+| 腳本 | 用途 | 指令 |
+|------|------|------|
+| `start_grasp.sh` | 完整語義抓取系統（8 pane） | `cd ~/handeye_ws && ./start_grasp.sh` |
+| `start_calibration.sh` | 手眼標定管線（4 pane） | `cd ~/handeye_ws && ./start_calibration.sh` |
+
+**tmux 操作：**
+- 切換 window：底部 `[ROS]` / `[AI]` tab 滑鼠點擊
+- 切換 pane：滑鼠點擊
+- 全螢幕 pane：`Ctrl+b` + `z`（再按還原）
+- 關閉系統：點右下角 `[ ✕ 關閉系統 ]` 或 `Ctrl+b` + `Q`
+
+**前置（腳本啟動前需手動完成）：**
+1. `sudo nmcli con up "UR3"` — 啟動機器人網卡
+2. `ngrok tcp 5555` — 啟動 Ngrok，並更新 `client_camera.py:26` server 地址
+3. AI Server 端先啟動 `server_anygrasp.py`
+
+> 以下手動步驟供需要單獨啟動某節點時參考。
+
+---
+
 ## 一、網段與連線準備
 
 **1. 啟動機器人網卡：**
@@ -36,8 +60,10 @@ ngrok tcp 5555
 ## 二、手眼標定（每次到現場先做）
 
 > 標定完成後外參 YAML 會自動存到 `~/.ros/easy_handeye/ur3_realsense_handeyecalibration_eye_on_base.yaml`，之後啟動系統直接讀取即可。
+>
+> **一鍵啟動：** `./start_calibration.sh`（自動開啟相機、手臂、MoveIt、標定 GUI）
 
-**前置：相機和手臂需先啟動（T1、T2、T3）**
+**手動啟動（前置：相機和手臂需先啟動 T1、T2、T3）：**
 **[T1] 相機：**
 ```bash
 roslaunch realsense2_camera rs_camera.launch align_depth:=true
@@ -79,7 +105,9 @@ cat ~/.ros/easy_handeye/ur3_realsense_handeyecalibration_eye_on_base.yaml
 
 ## 三、系統核心啟動（標定完成後，依序開）
 
+> **一鍵啟動：** `./start_grasp.sh`（自動開啟全部 8 個節點，含 conda 環境切換）
 
+**手動啟動（各節點分開開時參考）：**
 
 **[T4] RViz（安全確認用）：**
 ```bash

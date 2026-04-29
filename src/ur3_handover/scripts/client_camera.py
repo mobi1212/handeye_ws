@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+import ctypes
+ctypes.CDLL("/lib/x86_64-linux-gnu/libffi.so.7", mode=ctypes.RTLD_GLOBAL)
 import sys
 import os
 import json
@@ -31,7 +33,7 @@ class AnyGraspROSClient:
         rospy.init_node('anygrasp_ros_client', anonymous=True)
 
         # --- 參數設定 ---
-        self.server_addr = "tcp://0.tcp.jp.ngrok.io:19502" # ⚠️ 請更新 Ngrok 網址
+        self.server_addr = "tcp://0.tcp.jp.ngrok.io:16427" # ⚠️ 請更新 Ngrok 網址
 
         # --- 1. 初始化 ZMQ ---
         self.context = zmq.Context()
@@ -44,6 +46,7 @@ class AnyGraspROSClient:
 
         # --- 2. ROS 發佈與訂閱 ---
         self.pose_pub = rospy.Publisher('/anygrasp/target_pose', PoseStamped, queue_size=1)
+        self.grasp_pub = rospy.Publisher('/anygrasp/target_grasp', String, queue_size=1)
         self.color_sub = rospy.Subscriber("/camera/color/image_raw", Image, self.color_callback)
         self.depth_sub = rospy.Subscriber("/camera/aligned_depth_to_color/image_raw", Image, self.depth_callback)
 
@@ -343,17 +346,34 @@ class AnyGraspROSClient:
                 else:
                     clean_depth = depth_raw
 
-            self.process_anygrasp(color, clean_depth, bbox, name)
+            self.process_anygrasp(color, clean_depth, bbox, name, best_mask)
         finally:
             self.sending = False
             self.send_done = True
             self.send_count += 1
 
-    def process_anygrasp(self, color, depth, bbox, name):
+    def process_anygrasp(self, color, depth, bbox, name, best_mask=None):
         print(f"\n📤 正在發送目標 [{name}] 至大腦...")
         start_t = time.time()
         _, encoded = cv2.imencode('.jpg', color, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
-        payload = {'color_jpg': encoded, 'depth': depth, 'bbox': bbox}
+        payload = {
+            'color_jpg': encoded,
+            'depth': depth,
+            'bbox': bbox,
+            'intrinsics': {'fx': self.fx, 'fy': self.fy, 'cx': self.cx, 'cy': self.cy}
+        }
+
+        if best_mask is not None:
+            mask_resized = cv2.resize(
+                best_mask.astype(np.uint8) * 255,
+                (depth.shape[1], depth.shape[0]),
+                interpolation=cv2.INTER_NEAREST
+            )
+            ok, mask_encoded = cv2.imencode('.png', mask_resized)
+            if ok:
+                payload['mask'] = mask_encoded
+                print(f"🎭 已附帶 target mask，像素數: {int((mask_resized > 127).sum())}")
+
         compressed = zlib.compress(pickle.dumps(payload))
         try:
             self.socket.send(compressed)
@@ -373,9 +393,22 @@ class AnyGraspROSClient:
             print(f"🎯 獲得 6D 座標，分數: {result['score']:.4f}")
             tvec = np.array(result['translation'])
             rot_mat = np.array(result['rotation'])
+            stamp = rospy.Time.now()
+
+            grasp_meta = {
+                "frame_id": "camera_color_optical_frame",
+                "stamp": stamp.to_sec(),
+                "translation": tvec.tolist(),
+                "rotation": rot_mat.tolist(),
+                "score": float(result.get('score', 0.0)),
+                "width": float(result.get('width', 0.0)),
+                "depth": float(result.get('depth', 0.0)),
+            }
+            self.grasp_pub.publish(json.dumps(grasp_meta))
+
             pose_msg = PoseStamped()
             pose_msg.header.frame_id = "camera_color_optical_frame"
-            pose_msg.header.stamp = rospy.Time.now()
+            pose_msg.header.stamp = stamp
             pose_msg.pose.position.x, pose_msg.pose.position.y, pose_msg.pose.position.z = tvec
             T = np.eye(4); T[:3, :3] = rot_mat
             q = quaternion_from_matrix(T)

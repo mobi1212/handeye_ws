@@ -75,7 +75,7 @@ tmux set-option -p -t "$P_CTRL"  @label "🎮 controller"
 tmux set-option -p -t "$P_CLI"   @label "📸 client_camera"
 
 tmux send-keys -t "$P_RVIZ"  "cd $WS && source devel/setup.bash && sleep 10 && rosrun rviz rviz -d $WS/anygrasp_debug.rviz" Enter
-tmux send-keys -t "$P_BRAIN" "cd $WS && source devel/setup.bash && sleep 10 && $CONDA_INIT && conda activate grasp-py310 && rosrun ur3_handover brain_node.py" Enter
+tmux send-keys -t "$P_BRAIN" "cd $WS && source devel/setup.bash && sleep 10 && $CONDA_INIT && conda activate grasp-py310 && python3 src/ur3_handover/scripts/brain_node.py" Enter
 tmux send-keys -t "$P_CTRL"  "cd $WS && source devel/setup.bash && sleep 12 && $CONDA_INIT && conda activate anygrasp && rosrun ur3_handover semantic_grasp_controller.py" Enter
 tmux send-keys -t "$P_CLI"   "cd $WS/src/ur3_handover/scripts && source $WS/devel/setup.bash && sleep 15 && $CONDA_INIT && conda activate anygrasp && python3 client_camera.py" Enter
 
