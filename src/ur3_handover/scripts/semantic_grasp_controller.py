@@ -41,8 +41,10 @@ class SemanticGraspController:
         self.vel_scale = float(rospy.get_param("~vel_scale", 0.10))
         self.acc_scale = float(rospy.get_param("~acc_scale", 0.10))
 
-        # 固定交接點（法蘭位置）
-        self.handover_xyz = rospy.get_param("~handover_xyz", [0.1606, 0.2881, 0.3154])
+        # 固定交接點（物體位置，即指尖/TCP 位置，非 tool0）
+        self.handover_object_xyz = rospy.get_param("~handover_object_xyz", [0.1606, 0.2881, 0.1554])
+        # 待機點（tool0 位置，固定姿態）
+        self.ready_xyz = rospy.get_param("~ready_xyz", [-0.2456, 0.2653, 0.2889])
         # 力矩偵測參數
         self.handover_force_threshold = float(rospy.get_param("~handover_force_threshold", 10.0))
         self.handover_timeout = float(rospy.get_param("~handover_timeout", 30.0))
@@ -497,10 +499,10 @@ class SemanticGraspController:
         except: self.g = None
 
     # ------------------------------------------------------------------ #
-    #  待機點（放置區正上方）                                               #
+    #  待機點                                                              #
     # ------------------------------------------------------------------ #
     def go_to_ready_pose(self):
-        ready_xyz = list(self.handover_xyz)
+        ready_xyz = list(self.ready_xyz)
         ps_ready = self.make_pose_stamped_from_xyz_rpy(ready_xyz, [180.0, 0.0, 0.0])
         rospy.loginfo(f"[p2p] 前往待機點 {ready_xyz} ...")
         ok, _ = self.joint_plan_execute(ps_ready, "待機點")
@@ -553,8 +555,11 @@ class SemanticGraspController:
         rospy.loginfo("[p2p] final_grasp_xyz = (%.3f, %.3f, %.3f)", *grasp_info["final_grasp_xyz"])
         rospy.loginfo("[p2p] pregrasp_xyz    = (%.3f, %.3f, %.3f)", *grasp_info["pregrasp_xyz"])
 
-        # 交接點（保持抓取姿態）
-        ps_handover = self.make_pose_stamped(self.handover_xyz, ps_target.pose.orientation)
+        # 交接點：物體要在 handover_object_xyz，反推 tool0 位置
+        handover_tool0_xyz = np.array(self.handover_object_xyz) - ee_z * self.tcp_offset
+        ps_handover = self.make_pose_stamped(handover_tool0_xyz, ps_target.pose.orientation)
+        rospy.loginfo("[p2p] handover object  = (%.3f, %.3f, %.3f)", *self.handover_object_xyz)
+        rospy.loginfo("[p2p] handover tool0   = (%.3f, %.3f, %.3f)", *handover_tool0_xyz)
 
         # ── 動作 A：Pre-Grasp（規劃 → 確認迴圈）────────────────────────── #
         while True:
@@ -603,7 +608,8 @@ class SemanticGraspController:
         if not self.plan_execute_cartesian_to(lift_pose): return
 
         # ── 動作 E：關節規劃 → 交接點（保持抓取姿態）───────────────────── #
-        rospy.loginfo("[p2p] 移動至交接點 %s ...", self.handover_xyz)
+        rospy.loginfo("[p2p] 移動至交接點 object=%s, tool0=%s ...",
+                      self.handover_object_xyz, handover_tool0_xyz.tolist())
         ok, _ = self.joint_plan_execute(ps_handover, "交接點")
         if not ok: return
 
