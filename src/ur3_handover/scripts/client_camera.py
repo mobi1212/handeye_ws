@@ -33,7 +33,7 @@ class AnyGraspROSClient:
         rospy.init_node('anygrasp_ros_client', anonymous=True)
 
         # --- 參數設定 ---
-        self.server_addr = "tcp://0.tcp.jp.ngrok.io:16427" # ⚠️ 請更新 Ngrok 網址
+        self.server_addr = "tcp://0.tcp.jp.ngrok.io:23753" # ⚠️ 請更新 Ngrok 網址
 
         # --- 1. 初始化 ZMQ ---
         self.context = zmq.Context()

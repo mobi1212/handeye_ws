@@ -6,13 +6,16 @@ Semantic Grasp Controller (AnyGrasp 6D Pose 接收版)
 
 import json
 import os, sys, math, numpy as np
+import traceback
 # 確保從 scripts 目錄直接載入，避免 catkin relay exec() 的 import 問題
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rospy
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, WrenchStamped
 from std_msgs.msg import String
 from tf.transformations import quaternion_matrix, quaternion_multiply, quaternion_from_euler, quaternion_from_matrix
 from moveit_commander import MoveGroupCommander, roscpp_initialize
+from moveit_msgs.msg import MoveItErrorCodes
+from moveit_msgs.srv import GetPositionIK, GetPositionIKRequest
 import tf2_ros, tf2_geometry_msgs
 
 from robotiq_gripper import RobotiqGripper
@@ -23,9 +26,12 @@ class SemanticGraspController:
         self.base_frame  = rospy.get_param("~base_frame", "base_link")
         self.move_group  = rospy.get_param("~move_group", "manipulator")
         self.use_grasp_metadata = bool(rospy.get_param("~use_grasp_metadata", True))
-        self.prefer_camera_facing_side = bool(rospy.get_param("~prefer_camera_facing_side", False))
+        self.prefer_camera_facing_side = bool(rospy.get_param("~prefer_camera_facing_side", True))
+        self.use_server_depth_for_offset = bool(
+            rospy.get_param("~use_server_depth_for_offset", False))
+        self.prefer_nearest_ik = bool(rospy.get_param("~prefer_nearest_ik", True))
 
-        self.tcp_offset    = float(rospy.get_param("~tcp_offset",    0.18))
+        self.tcp_offset    = float(rospy.get_param("~tcp_offset",    0.16))
         self.grasp_depth   = float(rospy.get_param("~grasp_depth",   0.05))
         self.approach_dist = float(rospy.get_param("~approach_dist", 0.05))
 
@@ -35,8 +41,13 @@ class SemanticGraspController:
         self.vel_scale = float(rospy.get_param("~vel_scale", 0.10))
         self.acc_scale = float(rospy.get_param("~acc_scale", 0.10))
 
-        # 固定放置接觸點（法蘭位置）
-        self.final_xyz = [0.2401, 0.1751, 0.185]
+        # 固定交接點（法蘭位置）
+        self.handover_xyz = rospy.get_param("~handover_xyz", [0.1606, 0.2881, 0.3154])
+        # 力矩偵測參數
+        self.handover_force_threshold = float(rospy.get_param("~handover_force_threshold", 10.0))
+        self.handover_timeout = float(rospy.get_param("~handover_timeout", 30.0))
+        # wrench 即時值
+        self._wrench_force = np.zeros(3)
 
         # 夾爪
         self.grip_ip    = rospy.get_param("~gripper_ip",   "192.168.86.7")
@@ -58,6 +69,16 @@ class SemanticGraspController:
 
         self.tfbuf = tf2_ros.Buffer(cache_time=rospy.Duration(10.0))
         self.tflis = tf2_ros.TransformListener(self.tfbuf)
+        self.ik_service_name = rospy.get_param("~ik_service", "/compute_ik")
+        self.ik_srv = None
+        if self.prefer_nearest_ik:
+            try:
+                rospy.wait_for_service(self.ik_service_name, timeout=2.0)
+                self.ik_srv = rospy.ServiceProxy(self.ik_service_name, GetPositionIK)
+                rospy.loginfo("[p2p] 啟用最近 IK 分支規劃: %s", self.ik_service_name)
+            except (rospy.ROSException, rospy.ROSInterruptException):
+                rospy.logwarn("[p2p] 找不到 IK service %s，退回 pose target 規劃",
+                              self.ik_service_name)
 
         self.target_pose_topic = rospy.get_param("~target_pose_topic", "/anygrasp/target_pose")
         self.target_grasp_topic = rospy.get_param("~target_grasp_topic", "/anygrasp/target_grasp")
@@ -71,8 +92,10 @@ class SemanticGraspController:
             self.pose_sub = rospy.Subscriber(
                 self.target_pose_topic, PoseStamped, self.cb_anygrasp_pose, queue_size=1)
             rospy.loginfo("[p2p] 使用 legacy PoseStamped: %s", self.target_pose_topic)
-        # 隨時回待機點的指令（另開終端機 rostopic pub /semantic_grasp/go_home std_msgs/String "go" -1）
+        # 隨時回待機點的指令
         rospy.Subscriber("/semantic_grasp/go_home", String, self._cb_go_home)
+        # TCP 力矩
+        rospy.Subscriber("/wrench", WrenchStamped, self._wrench_cb)
 
         rospy.loginfo("[p2p] 啟動完成，等待目標姿態...")
         rospy.loginfo("[p2p] 隨時回待機點: rostopic pub /semantic_grasp/go_home std_msgs/String 'go' -1")
@@ -185,20 +208,25 @@ class SemanticGraspController:
             ps_base.pose.orientation.x, ps_base.pose.orientation.y, \
                 ps_base.pose.orientation.z, ps_base.pose.orientation.w = q_safe
 
-        effective_depth = self.grasp_depth
+        server_depth = None
         if grasp_meta is not None:
             try:
-                effective_depth = float(grasp_meta.get("depth", self.grasp_depth))
+                server_depth = float(grasp_meta.get("depth", self.grasp_depth))
             except (TypeError, ValueError):
-                rospy.logwarn("[p2p] grasp metadata depth 非法，退回參數值 %.3f", self.grasp_depth)
-                effective_depth = self.grasp_depth
-            if effective_depth <= 0.0:
-                rospy.logwarn("[p2p] grasp metadata depth=%.3f 無效，退回參數值 %.3f",
-                              effective_depth, self.grasp_depth)
-                effective_depth = self.grasp_depth
-            rospy.loginfo("[p2p] 採用 server grasp_depth = %.3f", effective_depth)
+                rospy.logwarn("[p2p] grasp metadata depth 非法，忽略 server depth")
+                server_depth = None
+            if server_depth is not None and server_depth <= 0.0:
+                rospy.logwarn("[p2p] grasp metadata depth=%.3f 無效，忽略 server depth",
+                              server_depth)
+                server_depth = None
+            if server_depth is not None:
+                rospy.loginfo("[p2p] 收到 server grasp depth = %.3f", server_depth)
 
-        self.run_once(ps_base, grasp_depth=effective_depth)
+        final_insert_depth = self.resolve_final_insert_depth(server_depth)
+        self.run_once(
+            ps_base,
+            final_insert_depth=final_insert_depth,
+            server_depth=server_depth)
 
     def _cb_go_home(self, msg):
         rospy.loginfo("[p2p] 收到回待機點指令...")
@@ -245,10 +273,60 @@ class SemanticGraspController:
             total += sum(abs(j2 - j1) for j1, j2 in zip(a.positions, b.positions))
         return total
 
+    def solve_nearest_ik(self, ps_target):
+        if self.ik_srv is None:
+            return None
+
+        req = GetPositionIKRequest()
+        req.ik_request.group_name = self.move_group
+        req.ik_request.pose_stamped = ps_target
+        req.ik_request.robot_state = self.group.get_current_state()
+        req.ik_request.avoid_collisions = True
+        req.ik_request.timeout = rospy.Duration(0.2)
+
+        ee_link = self.group.get_end_effector_link()
+        if ee_link:
+            req.ik_request.ik_link_name = ee_link
+
+        try:
+            resp = self.ik_srv(req)
+        except rospy.ServiceException as e:
+            rospy.logwarn("[p2p] IK service 呼叫失敗，退回 pose target 規劃: %s", e)
+            return None
+
+        if resp.error_code.val != MoveItErrorCodes.SUCCESS:
+            rospy.logwarn("[p2p] IK 求解失敗(error=%s)，退回 pose target 規劃",
+                          resp.error_code.val)
+            return None
+
+        joint_map = dict(zip(resp.solution.joint_state.name, resp.solution.joint_state.position))
+        active_joints = self.group.get_active_joints()
+        try:
+            joint_target = [joint_map[name] for name in active_joints]
+        except KeyError as e:
+            rospy.logwarn("[p2p] IK 解缺少關節 %s，退回 pose target 規劃", e)
+            return None
+
+        rospy.loginfo("[p2p] 採用最近 IK 分支作為 joint target")
+        return joint_target
+
     def joint_plan_execute(self, ps_target, label="目標點", n_attempts=3, execute=True):
         """多次規劃取最短關節路徑，可選擇只規劃不執行（供安全確認用）"""
         self._normalize_start_state()
-        self.group.set_pose_target(ps_target)
+        joint_target = self.solve_nearest_ik(ps_target) if self.prefer_nearest_ik else None
+        try:
+            if joint_target is not None:
+                self.group.set_joint_value_target(joint_target)
+            else:
+                self.group.set_pose_target(ps_target)
+        except Exception as e:
+            if joint_target is not None:
+                rospy.logwarn("[p2p] %s 設定 joint target 失敗，退回 pose target 規劃: %s",
+                              label, e)
+                self.group.clear_pose_targets()
+                self.group.set_pose_target(ps_target)
+            else:
+                raise
         best_plan, best_len = None, float('inf')
         for i in range(n_attempts):
             success, plan, _, error_code = self.group.plan()
@@ -284,6 +362,47 @@ class SemanticGraspController:
         M = quaternion_matrix(quat_xyzw)
         z_axis = M[0:3, 2]
         return z_axis / np.linalg.norm(z_axis)
+
+    def resolve_final_insert_depth(self, server_depth):
+        """決定 grasp reference pose 轉成機器人 final grasp pose 時的前進補償量。"""
+        if self.use_server_depth_for_offset and server_depth is not None:
+            rospy.loginfo("[p2p] final grasp offset 使用 server depth = %.3f", server_depth)
+            return float(server_depth)
+
+        if server_depth is not None:
+            rospy.loginfo(
+                "[p2p] final grasp offset 使用本地 grasp_depth = %.3f（server depth %.3f 僅記錄）",
+                self.grasp_depth, server_depth)
+        else:
+            rospy.loginfo("[p2p] final grasp offset 使用本地 grasp_depth = %.3f", self.grasp_depth)
+        return self.grasp_depth
+
+    def build_robot_grasp_poses(self, grasp_ref_pose, final_insert_depth):
+        """
+        AnyGrasp 回傳的是 grasp reference pose。
+        先轉成 UR3 final grasp pose，再由 final grasp 沿接近軸退回 pre-grasp。
+        """
+        grasp_ref_xyz = np.array([
+            grasp_ref_pose.pose.position.x,
+            grasp_ref_pose.pose.position.y,
+            grasp_ref_pose.pose.position.z
+        ], dtype=float)
+        ee_z = self.get_ee_z_axis_in_base(grasp_ref_pose)
+
+        # final grasp pose: 由 grasp reference pose 沿接近軸補償插入量，再扣掉 tool0 到夾爪工作點的固定偏移
+        final_grasp_xyz = grasp_ref_xyz + ee_z * final_insert_depth - ee_z * self.tcp_offset
+        pregrasp_xyz = final_grasp_xyz - ee_z * self.approach_dist
+
+        ps_grasp = self.make_pose_stamped(final_grasp_xyz, grasp_ref_pose.pose.orientation)
+        ps_pre = self.make_pose_stamped(pregrasp_xyz, grasp_ref_pose.pose.orientation)
+
+        return ps_grasp, ps_pre, {
+            "grasp_ref_xyz": grasp_ref_xyz,
+            "final_grasp_xyz": final_grasp_xyz,
+            "pregrasp_xyz": pregrasp_xyz,
+            "ee_z": ee_z,
+            "final_insert_depth": float(final_insert_depth),
+        }
 
     def select_camera_facing_orientation(self, q_orig, object_surface, camera_pos):
         camera_to_object = object_surface - camera_pos
@@ -336,6 +455,41 @@ class SemanticGraspController:
             ps.pose.orientation.z, ps.pose.orientation.w = qx, qy, qz, qw
         return ps
 
+    def _wrench_cb(self, msg: WrenchStamped):
+        f = msg.wrench.force
+        self._wrench_force = np.array([f.x, f.y, f.z])
+
+    def _measure_wrench_baseline(self, duration=0.5):
+        samples = []
+        t0 = rospy.Time.now().to_sec()
+        rate = rospy.Rate(20)
+        while rospy.Time.now().to_sec() - t0 < duration:
+            samples.append(np.linalg.norm(self._wrench_force))
+            rate.sleep()
+        baseline = float(np.mean(samples)) if samples else 0.0
+        rospy.loginfo("[p2p] wrench baseline = %.2f N (%d samples)", baseline, len(samples))
+        return baseline
+
+    def _wait_for_handover(self, baseline):
+        rospy.loginfo("[p2p] 等待人手接取（threshold=%.1f N, timeout=%.0fs）...",
+                      self.handover_force_threshold, self.handover_timeout)
+        t0 = rospy.Time.now().to_sec()
+        rate = rospy.Rate(20)
+        CONFIRM_COUNT = 1  # 連續 2 次即觸發
+        confirm = 0
+        while rospy.Time.now().to_sec() - t0 < self.handover_timeout:
+            delta = abs(np.linalg.norm(self._wrench_force) - baseline)
+            if delta > self.handover_force_threshold:
+                confirm += 1
+                if confirm >= CONFIRM_COUNT:
+                    rospy.loginfo("[p2p] 偵測到持續拉力 delta=%.2f N", delta)
+                    return True
+            else:
+                confirm = 0
+            rate.sleep()
+        rospy.logwarn("[p2p] 交接逾時（%.0fs），自動鬆手", self.handover_timeout)
+        return False
+
     def init_gripper(self):
         try:
             self.g.connect(self.grip_ip, self.grip_port); self.g.activate()
@@ -346,8 +500,7 @@ class SemanticGraspController:
     #  待機點（放置區正上方）                                               #
     # ------------------------------------------------------------------ #
     def go_to_ready_pose(self):
-        ready_xyz = [self.final_xyz[0], self.final_xyz[1],
-                     self.final_xyz[2] + self.retreat_up_height]
+        ready_xyz = list(self.handover_xyz)
         ps_ready = self.make_pose_stamped_from_xyz_rpy(ready_xyz, [180.0, 0.0, 0.0])
         rospy.loginfo(f"[p2p] 前往待機點 {ready_xyz} ...")
         ok, _ = self.joint_plan_execute(ps_ready, "待機點")
@@ -370,40 +523,38 @@ class SemanticGraspController:
     # ------------------------------------------------------------------ #
     #  核心流程                                                             #
     # ------------------------------------------------------------------ #
-    def run_once(self, ps_target, grasp_depth=None):
+    def run_once(self, ps_target, final_insert_depth=None, server_depth=None):
         try:
-            self._grasp_and_place(ps_target, grasp_depth=grasp_depth)
+            self._grasp_and_place(
+                ps_target,
+                final_insert_depth=final_insert_depth,
+                server_depth=server_depth)
+        except Exception as e:
+            rospy.logerr("[p2p] 抓取流程未捕捉例外: %s", e)
+            rospy.logerr("%s", traceback.format_exc())
         finally:
             self._prompt_ready()
 
-    def _grasp_and_place(self, ps_target, grasp_depth=None):
-        # ── 幾何計算 ──────────────────────────────────────────────────── #
-        target_xyz = np.array([ps_target.pose.position.x,
-                                ps_target.pose.position.y,
-                                ps_target.pose.position.z])
-        ee_z = self.get_ee_z_axis_in_base(ps_target)  # 抓取方向軸
-        grasp_depth = self.grasp_depth if grasp_depth is None else float(grasp_depth)
+    def _grasp_and_place(self, ps_target, final_insert_depth=None, server_depth=None):
+        final_insert_depth = (
+            self.grasp_depth if final_insert_depth is None else float(final_insert_depth))
+        ps_grasp, ps_pre, grasp_info = self.build_robot_grasp_poses(
+            ps_target, final_insert_depth)
+        ee_z = grasp_info["ee_z"]
+        grasp_xyz = grasp_info["final_grasp_xyz"]
 
-        rospy.loginfo("[p2p] target_anchor = (%.3f, %.3f, %.3f)", *target_xyz)
+        rospy.loginfo("[p2p] grasp_ref_xyz   = (%.3f, %.3f, %.3f)", *grasp_info["grasp_ref_xyz"])
+        rospy.loginfo("[p2p] ee_z            = (%.3f, %.3f, %.3f)", *ee_z)
+        if server_depth is not None:
+            rospy.loginfo("[p2p] server_depth    = %.3f", server_depth)
+        rospy.loginfo(
+            "[p2p] final_insert_depth = %.3f, tcp_offset = %.3f, approach_dist = %.3f",
+            grasp_info["final_insert_depth"], self.tcp_offset, self.approach_dist)
+        rospy.loginfo("[p2p] final_grasp_xyz = (%.3f, %.3f, %.3f)", *grasp_info["final_grasp_xyz"])
+        rospy.loginfo("[p2p] pregrasp_xyz    = (%.3f, %.3f, %.3f)", *grasp_info["pregrasp_xyz"])
 
-        # grasp anchor 往內 grasp_depth → 再退 tcp_offset = 法蘭位置
-        grasp_xyz = target_xyz + ee_z * grasp_depth - ee_z * self.tcp_offset
-        # Pre-Grasp = 法蘭位置沿抓取軸退 approach_dist
-        pre_xyz   = grasp_xyz - ee_z * self.approach_dist
-
-        ps_grasp = self.make_pose_stamped(grasp_xyz, ps_target.pose.orientation)
-        ps_pre   = self.make_pose_stamped(pre_xyz,   ps_target.pose.orientation)
-
-        rospy.loginfo("[p2p] ee_z = (%.3f, %.3f, %.3f)", *ee_z)
-        rospy.loginfo("[p2p] grasp_depth = %.3f, tcp_offset = %.3f", grasp_depth, self.tcp_offset)
-        rospy.loginfo("[p2p] grasp_xyz = (%.3f, %.3f, %.3f)", *grasp_xyz)
-        rospy.loginfo("[p2p] pre_xyz   = (%.3f, %.3f, %.3f)", *pre_xyz)
-
-        # 放置：pre_place 沿同一抓取軸退 approach_dist（保持抓取姿態，不強制垂直）
-        final_xyz     = np.array(self.final_xyz)
-        pre_place_xyz = final_xyz - ee_z * self.approach_dist
-        ps_place      = self.make_pose_stamped(final_xyz,     ps_target.pose.orientation)
-        ps_pre_place  = self.make_pose_stamped(pre_place_xyz, ps_target.pose.orientation)
+        # 交接點（保持抓取姿態）
+        ps_handover = self.make_pose_stamped(self.handover_xyz, ps_target.pose.orientation)
 
         # ── 動作 A：Pre-Grasp（規劃 → 確認迴圈）────────────────────────── #
         while True:
@@ -444,31 +595,29 @@ class SemanticGraspController:
         except EOFError:
             pass
 
-        # ── 動作 D：Cartesian 垂直抬升 10 ──────────────────────────────── #
-        rospy.loginfo("[p2p] 垂直抬升 10...")
+        # ── 動作 D：Cartesian 垂直抬升 10cm ─────────────────────────────── #
+        rospy.loginfo("[p2p] 垂直抬升 10cm...")
         lift_pose = self.make_pose_stamped(
             [grasp_xyz[0], grasp_xyz[1], grasp_xyz[2] + 0.1],
             ps_grasp.pose.orientation)
         if not self.plan_execute_cartesian_to(lift_pose): return
 
-        # ── 動作 E：關節規劃 → Pre-Place（保持抓取姿態）─────────────────── #
-        rospy.loginfo("[p2p] 關節規劃前往放置前置點...")
-        ok, _ = self.joint_plan_execute(ps_pre_place, "放置前置點")
+        # ── 動作 E：關節規劃 → 交接點（保持抓取姿態）───────────────────── #
+        rospy.loginfo("[p2p] 移動至交接點 %s ...", self.handover_xyz)
+        ok, _ = self.joint_plan_execute(ps_handover, "交接點")
         if not ok: return
 
-        # ── 動作 F：Cartesian 沿抓取軸前進至放置接觸點 ──────────────────── #
-        rospy.loginfo("[p2p] 沿抓取方向降下至放置點...")
-        if not self.plan_execute_cartesian_to(ps_place): return
+        # ── 動作 F：記錄 baseline → 等人拉 → 鬆手 ───────────────────────── #
+        rospy.loginfo("[p2p] 到達交接點，等待穩定...")
+        rospy.sleep(1.0)  # 等手臂震動消散
+        baseline = self._measure_wrench_baseline(duration=1.0)
+        self._wait_for_handover(baseline)
 
         # ── 動作 G：張開夾爪 ────────────────────────────────────────────── #
         if self.g: self.g.move_and_wait_for_pos(0, self.grip_speed, self.grip_force)
-        rospy.loginfo("[p2p] 夾爪張開，物體已放置")
+        rospy.loginfo("[p2p] 夾爪張開，物體已交接")
 
-        # ── 動作 H：Cartesian 後退至 Pre-Place ──────────────────────────── #
-        rospy.loginfo("[p2p] 退出放置點...")
-        self.plan_execute_cartesian_to(ps_pre_place)  # 失敗不中止，繼續到 finally
-
-        rospy.loginfo("[p2p] 🎉 任務完成！")
+        rospy.loginfo("[p2p] 🎉 交接完成！")
 
 
 if __name__ == "__main__":

@@ -413,7 +413,7 @@ class SemanticBrainNode:
                 raise RuntimeError("所有模型均無法使用，請稍後再試")
 
             clean_json = response.text.replace("```json", "").replace("```", "").strip()
-            vlm_result = json.loads(clean_json)
+            vlm_result = json.loads(clean_json, strict=False)
 
             target_grids = vlm_result.get('target_grids', [])
             com_grid     = vlm_result.get('estimated_com_grid', 'N/A')

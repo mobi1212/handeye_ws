@@ -42,6 +42,9 @@ secrets/
 
 vlm_logs/
 
+# ML model files
+models/
+
 # Accidentally extracted packages
  /
 .codex

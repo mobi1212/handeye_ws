@@ -94,10 +94,10 @@ click_to_pick_cv.py  →  YOLO 偵測像素 → pixel_to_base.py (TF 投影)
 | 參數 | 預設值 | 說明 |
 |------|--------|------|
 | `tcp_offset` | 0.18 m | 夾爪指尖到 MoveIt EEF 距離 |
-| `grasp_depth` | 0.04 m | 物體表面往內插入深度 |
+| `grasp_depth` | 0.05 m | 物體表面往內插入深度 |
 | `approach_dist` | 0.05 m | Pre-Grasp 退後距離 |
-| `retreat_up_height` | 0.15 m | 抓取後垂直抬升 |
-| `final_xyz` | `[0.2, 0.1, 0.185]` | 固定放置座標（硬編碼） |
+| `retreat_up_height` | 0.14 m | 待機點高於放置點的高度 |
+| `final_xyz` | `[0.2401, 0.1751, 0.185]` | 固定放置座標（法蘭位置） |
 
 安全桌面檢查（`TABLE_HEIGHT`）目前被 `#` 註解，虛擬桌面碰撞物件設在 `base_link` Z=-0.05m。
 
