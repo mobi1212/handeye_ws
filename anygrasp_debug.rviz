@@ -401,6 +401,7 @@ Visualization Manager:
       Namespaces:
         handover_landmarks: true
         handover_palm: true
+        handover_palm_normal: false
         handover_skeleton: true
         handover_status: true
         handover_zone: true

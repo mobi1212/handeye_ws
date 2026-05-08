@@ -124,6 +124,16 @@ class HandoverPerceptionNode:
             ),
             dtype=float,
         )
+        self.swap_handedness_labels = bool(self._get_param(
+            "~swap_handedness_labels", "/semantic_handover/swap_handedness_labels", True))
+        self.right_hand_normal_sign = float(self._get_param(
+            "~right_hand_normal_sign", "/semantic_handover/right_hand_normal_sign", 1.0))
+        self.left_hand_normal_sign = float(self._get_param(
+            "~left_hand_normal_sign", "/semantic_handover/left_hand_normal_sign", -1.0))
+        self.handedness_debounce_frames = int(self._get_param(
+            "~handedness_debounce_frames", "/semantic_handover/handedness_debounce_frames", 3))
+        self.palm_normal_ema_alpha = float(self._get_param(
+            "~palm_normal_ema_alpha", "/semantic_handover/palm_normal_ema_alpha", 0.25))
 
         if not os.path.exists(self.model_path):
             rospy.logfatal("找不到 hand landmarker model: %s", self.model_path)
@@ -159,6 +169,10 @@ class HandoverPerceptionNode:
         self.cy = None
 
         self.palm_history = deque(maxlen=max(1, self.stability_window))
+        self._stable_handedness = "Unknown"
+        self._pending_handedness = "Unknown"
+        self._pending_handedness_count = 0
+        self._smoothed_palm_normal = None
         self.processing = False
         self._reload_handover_config_if_needed(force=True)
 
@@ -222,18 +236,38 @@ class HandoverPerceptionNode:
             cfg.get("handover_zone_color_rgba", self.handover_zone_color_rgba.tolist()),
             dtype=float,
         )
+        swap_handedness_labels = bool(
+            cfg.get("swap_handedness_labels", self.swap_handedness_labels))
+        right_hand_normal_sign = float(
+            cfg.get("right_hand_normal_sign", self.right_hand_normal_sign))
+        left_hand_normal_sign = float(
+            cfg.get("left_hand_normal_sign", self.left_hand_normal_sign))
+        handedness_debounce_frames = int(
+            cfg.get("handedness_debounce_frames", self.handedness_debounce_frames))
+        palm_normal_ema_alpha = float(
+            cfg.get("palm_normal_ema_alpha", self.palm_normal_ema_alpha))
 
         self.zone_min = zone_min
         self.zone_max = zone_max
         self.handover_zone_visible = zone_visible
         self.handover_zone_color_rgba = zone_color_rgba
+        self.swap_handedness_labels = swap_handedness_labels
+        self.right_hand_normal_sign = right_hand_normal_sign
+        self.left_hand_normal_sign = left_hand_normal_sign
+        self.handedness_debounce_frames = max(1, handedness_debounce_frames)
+        self.palm_normal_ema_alpha = float(np.clip(palm_normal_ema_alpha, 0.0, 1.0))
         self._handover_config_mtime = mtime
         rospy.loginfo(
-            "[handover] 已重載 handover config: zone min=%s max=%s visible=%s color=%s",
+            "[handover] 已重載 handover config: zone min=%s max=%s visible=%s color=%s swap_handedness=%s signs=(R:%s,L:%s) debounce=%d ema=%.2f",
             self.zone_min.tolist(),
             self.zone_max.tolist(),
             self.handover_zone_visible,
             self.handover_zone_color_rgba.tolist(),
+            self.swap_handedness_labels,
+            self.right_hand_normal_sign,
+            self.left_hand_normal_sign,
+            self.handedness_debounce_frames,
+            self.palm_normal_ema_alpha,
         )
 
     def _camera_info_cb(self, msg: CameraInfo):
@@ -309,6 +343,7 @@ class HandoverPerceptionNode:
             "frame_id": self.base_frame,
             "stamp": stamp.to_sec(),
             "palm_center_3d": None,
+            "palm_normal_3d": None,
             "stability": 0.0,
             "in_zone": False,
             "reason": "no_hand",
@@ -318,10 +353,12 @@ class HandoverPerceptionNode:
 
         if len(result.hand_landmarks) == 0:
             self.palm_history.clear()
+            self._smoothed_palm_normal = None
             return state, markers
         if len(result.hand_landmarks) > 1:
             state["reason"] = "multiple_hands"
             self.palm_history.clear()
+            self._smoothed_palm_normal = None
             return state, self._build_base_markers(state)
 
         hand_landmarks = result.hand_landmarks[0]
@@ -340,6 +377,7 @@ class HandoverPerceptionNode:
         if depth_m is None:
             state["reason"] = "invalid_depth"
             self.palm_history.clear()
+            self._smoothed_palm_normal = None
             return state, self._build_base_markers(state)
 
         point_cam = np.array([
@@ -351,10 +389,16 @@ class HandoverPerceptionNode:
         if point_base is None:
             state["reason"] = "tf_unavailable"
             self.palm_history.clear()
+            self._smoothed_palm_normal = None
             return state, self._build_base_markers(state)
 
         landmark_points_base = self._compute_landmark_points_in_base(
             hand_landmarks, depth, stamp)
+        raw_handedness = (
+            result.handedness[0][0].category_name
+            if result.handedness and result.handedness[0] else "Unknown")
+        handedness = self._stabilize_handedness(self._normalize_handedness(raw_handedness))
+        palm_normal = self._compute_palm_normal(point_base, landmark_points_base, handedness)
 
         in_zone = bool(np.all(point_base >= self.zone_min) and np.all(point_base <= self.zone_max))
         if in_zone:
@@ -367,13 +411,14 @@ class HandoverPerceptionNode:
         state.update({
             "valid": True,
             "palm_center_3d": point_base.tolist(),
+            "palm_normal_3d": palm_normal.tolist() if palm_normal is not None else None,
             "stability": stability,
             "in_zone": in_zone,
             "reason": "ok" if in_zone else "out_of_zone",
             "palm_center_px": [u, v],
             "depth_m": depth_m,
-            "handedness": result.handedness[0][0].category_name
-            if result.handedness and result.handedness[0] else "Unknown",
+            "handedness_raw": raw_handedness,
+            "handedness": handedness,
         })
         return state, self._build_base_markers(
             state, landmark_points_base=landmark_points_base)
@@ -449,6 +494,100 @@ class HandoverPerceptionNode:
             points.append(point_base)
         return points
 
+    def _normalize_handedness(self, handedness):
+        label = str(handedness).strip().capitalize()
+        if label not in ("Left", "Right"):
+            return "Unknown"
+        if not self.swap_handedness_labels:
+            return label
+        return "Left" if label == "Right" else "Right"
+
+    def _stabilize_handedness(self, handedness):
+        if handedness not in ("Left", "Right"):
+            self._pending_handedness = "Unknown"
+            self._pending_handedness_count = 0
+            return self._stable_handedness
+        if handedness == self._stable_handedness:
+            self._pending_handedness = handedness
+            self._pending_handedness_count = 0
+            return self._stable_handedness
+        if handedness != self._pending_handedness:
+            self._pending_handedness = handedness
+            self._pending_handedness_count = 1
+        else:
+            self._pending_handedness_count += 1
+        if self._pending_handedness_count >= self.handedness_debounce_frames:
+            self._stable_handedness = handedness
+            self._pending_handedness = handedness
+            self._pending_handedness_count = 0
+        return self._stable_handedness
+
+    def _smooth_palm_normal(self, normal):
+        if normal is None:
+            self._smoothed_palm_normal = None
+            return None
+        current = np.array(normal, dtype=float)
+        norm = np.linalg.norm(current)
+        if norm < 1e-6:
+            return None
+        current = current / norm
+
+        if self._smoothed_palm_normal is None:
+            self._smoothed_palm_normal = current
+            return current
+
+        previous = np.array(self._smoothed_palm_normal, dtype=float)
+        prev_norm = np.linalg.norm(previous)
+        if prev_norm < 1e-6:
+            self._smoothed_palm_normal = current
+            return current
+        previous = previous / prev_norm
+
+        if float(np.dot(current, previous)) < 0.0:
+            current = -current
+
+        alpha = float(np.clip(self.palm_normal_ema_alpha, 0.0, 1.0))
+        blended = (1.0 - alpha) * previous + alpha * current
+        blend_norm = np.linalg.norm(blended)
+        if blend_norm < 1e-6:
+            blended = current
+            blend_norm = np.linalg.norm(blended)
+        blended = blended / max(blend_norm, 1e-6)
+        self._smoothed_palm_normal = blended
+        return blended
+
+    def _compute_palm_normal(self, palm_center, landmark_points_base, handedness):
+        required_ids = (0, 5, 9, 17)
+        if landmark_points_base is None:
+            return None
+        if any(idx >= len(landmark_points_base) or landmark_points_base[idx] is None for idx in required_ids):
+            return None
+
+        wrist = np.array(landmark_points_base[0], dtype=float)
+        index_mcp = np.array(landmark_points_base[5], dtype=float)
+        middle_mcp = np.array(landmark_points_base[9], dtype=float)
+        pinky_mcp = np.array(landmark_points_base[17], dtype=float)
+
+        across = pinky_mcp - index_mcp
+        forward = middle_mcp - wrist
+        if np.linalg.norm(across) < 1e-6 or np.linalg.norm(forward) < 1e-6:
+            return None
+
+        normal = np.cross(across, forward)
+        norm = np.linalg.norm(normal)
+        if norm < 1e-6:
+            return None
+        normal = normal / norm
+        if handedness == "Right":
+            sign = self.right_hand_normal_sign
+        elif handedness == "Left":
+            sign = self.left_hand_normal_sign
+        else:
+            sign = 1.0
+        if sign < 0.0:
+            normal = -normal
+        return self._smooth_palm_normal(normal)
+
     def _publish_markers(self, markers):
         delete_all = Marker()
         delete_all.header.frame_id = self.base_frame
@@ -468,6 +607,9 @@ class HandoverPerceptionNode:
         palm_center = state.get("palm_center_3d")
         if isinstance(palm_center, (list, tuple)) and len(palm_center) == 3:
             markers.append(self._make_palm_marker(stamp, palm_center, state))
+            palm_normal = state.get("palm_normal_3d")
+            if isinstance(palm_normal, (list, tuple)) and len(palm_normal) == 3:
+                markers.append(self._make_palm_normal_marker(stamp, palm_center, palm_normal, state))
 
         if landmark_points_base:
             markers.append(self._make_landmark_marker(stamp, landmark_points_base, state))
@@ -523,6 +665,36 @@ class HandoverPerceptionNode:
             marker.color.r = 1.0
             marker.color.g = 0.7
             marker.color.b = 0.2
+        marker.color.a = 0.95
+        return marker
+
+    def _make_palm_normal_marker(self, stamp, palm_center, palm_normal, state):
+        marker = self._marker_template(stamp, 5, "handover_palm_normal", Marker.ARROW)
+        start = np.array(palm_center, dtype=float)
+        direction = np.array(palm_normal, dtype=float)
+        length = 0.10
+        end = start + direction * length
+
+        p1 = PointStamped().point
+        p1.x = float(start[0])
+        p1.y = float(start[1])
+        p1.z = float(start[2])
+        p2 = PointStamped().point
+        p2.x = float(end[0])
+        p2.y = float(end[1])
+        p2.z = float(end[2])
+        marker.points = [p1, p2]
+        marker.scale.x = 0.01
+        marker.scale.y = 0.02
+        marker.scale.z = 0.03
+        if bool(state.get("in_zone", False)):
+            marker.color.r = 0.1
+            marker.color.g = 0.9
+            marker.color.b = 1.0
+        else:
+            marker.color.r = 0.7
+            marker.color.g = 0.7
+            marker.color.b = 1.0
         marker.color.a = 0.95
         return marker
 

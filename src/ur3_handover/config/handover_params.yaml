@@ -7,25 +7,32 @@
 #    - handover_object_offset_xyz: 物體相對手心的偏移
 #    - force_release_threshold: 力矩放手門檻
 #    - handover_zone_visible / handover_zone_color_rgba: RViz 交接區顯示樣式
+#    - swap_handedness_labels / right_hand_normal_sign / left_hand_normal_sign: 掌心箭頭正反面調整
+#    - handedness_debounce_frames / palm_normal_ema_alpha: 掌心箭頭穩定化
 semantic_handover:
   hand_state_topic: /semantic_handover/hand_state
   marker_topic: /semantic_handover/markers
   user_cmd_topic: /semantic_handover/user_cmd
 
   use_dynamic_handover: true
-  handover_object_offset_xyz: [0.0, 0.0, 0.0]
+  handover_object_offset_xyz: [0.0, 0.2, 0.03]
 
   # Edit these on site to tune the handover zone quickly.
-  handover_zone_center_xyz: [0.25, 0.28, 0.15]
+  handover_zone_center_xyz: [0.21, 0.28, 0.15]
   handover_zone_half_extents_xyz: [0.10, 0.20, 0.08]
   handover_zone_visible: true
   handover_zone_color_rgba: [0.1, 0.5, 1.0, 0.5]
+  swap_handedness_labels: true
+  right_hand_normal_sign: 1.0
+  left_hand_normal_sign: -1.0
+  handedness_debounce_frames: 3
+  palm_normal_ema_alpha: 0.25
 
   process_hz: 8.0
   depth_sample_radius_px: 6
   min_valid_depth_m: 0.15
   max_valid_depth_m: 1.20
-  stability_window: 5
+  stability_window: 8
   stability_pos_threshold: 0.03
   hand_state_stability_threshold: 0.85
   handover_hand_timeout: 10.0
