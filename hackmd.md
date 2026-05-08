@@ -7,31 +7,28 @@
 > * **大腦 (桌機端)**：`server_anygrasp.py` — 接收影像，運算全空間 6D 抓取姿態
 > * **AI 視覺 (筆電端)**：`brain_node.py` — OWL-v2 + SAM + Gemini，語義物件分割
 > * **眼睛 (筆電端)**：`client_camera.py` — 相機畫面、VLM 觸發、SVD 桌面擬合、ZMQ 傳送
+> * **交接感知 (筆電端)**：`handover_perception.py` — MediaPipe Hands、手心 3D、handover RViz markers
 > * **肌肉 (ROS 端)**：`semantic_grasp_controller.py` — TF 轉換、MoveIt 規劃執行、夾爪控制
 >
 > **⚠️ 前提條件**：手眼標定已完成，外參 YAML 位於 `~/.ros/easy_handeye/ur3_realsense_handeyecalibration_eye_on_base.yaml`
+> **⚙️ handover 參數檔**：`src/ur3_handover/config/handover_params.yaml`，現場要改交接區域或力矩門檻時請優先改這個檔案
 
 ---
 
-## 零、一鍵啟動腳本（推薦）
+## 零、啟動腳本狀態
 
-工作區根目錄提供兩支 tmux 啟動腳本，自動分割 pane、啟動所有節點、配置 conda 環境：
+目前 `start_grasp.sh` 已停用，原因是 tmux 自動啟動時偶發 ROS master / MoveIt 啟動時序不一致。抓取流程目前以手動分開啟動各節點為準；`start_calibration.sh` 可照常使用。
 
 | 腳本 | 用途 | 指令 |
 |------|------|------|
-| `start_grasp.sh` | 完整語義抓取系統（8 pane） | `cd ~/handeye_ws && ./start_grasp.sh` |
+| `start_grasp.sh` | 抓取系統一鍵啟動 | 已停用，勿使用 |
 | `start_calibration.sh` | 手眼標定管線（4 pane） | `cd ~/handeye_ws && ./start_calibration.sh` |
-
-**tmux 操作：**
-- 切換 window：底部 `[ROS]` / `[AI]` tab 滑鼠點擊
-- 切換 pane：滑鼠點擊
-- 全螢幕 pane：`Ctrl+b` + `z`（再按還原）
-- 關閉系統：點右下角 `[ ✕ 關閉系統 ]` 或 `Ctrl+b` + `Q`
 
 **前置（腳本啟動前需手動完成）：**
 1. `sudo nmcli con up "UR3"` — 啟動機器人網卡
 2. `ngrok tcp 5555` — 啟動 Ngrok，並更新 `client_camera.py:26` server 地址
 3. AI Server 端先啟動 `server_anygrasp.py`
+4. 若要調整交接區域或力矩放手門檻，先編輯 `src/ur3_handover/config/handover_params.yaml`
 
 > 以下手動步驟供需要單獨啟動某節點時參考。
 
@@ -105,7 +102,7 @@ cat ~/.ros/easy_handeye/ur3_realsense_handeyecalibration_eye_on_base.yaml
 
 ## 三、系統核心啟動（標定完成後，依序開）
 
-> **一鍵啟動：** `./start_grasp.sh`（自動開啟全部 8 個節點，含 conda 環境切換）
+> `start_grasp.sh` 目前停用；以下手動流程為正式做法。
 
 **手動啟動（各節點分開開時參考）：**
 
@@ -164,6 +161,16 @@ python3 client_camera.py
 ```
 
 相機畫面彈出，左側即時畫面，右側抓取姿態預覽。
+
+**[T10] 交接感知節點（handover_perception）：**
+```bash
+cd ~/handeye_ws
+source devel/setup.bash
+rosrun ur3_handover handover_perception.py
+```
+
+> `handover_perception.py` 請直接用系統 Python 執行，不要在 conda 環境下啟動。
+> `semantic_grasp_controller.py` 目前改回純力矩釋放，不再需要手動送 `release` 指令。
 
 ---
 

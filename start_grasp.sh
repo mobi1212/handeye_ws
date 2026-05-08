@@ -1,14 +1,11 @@
 #!/bin/bash
-# UR3 語義抓取系統 — 一鍵啟動腳本
-# 用法：./start_grasp.sh
-#
-# ─── 操作方式 ────────────────────────────────────────────
-#  切換 window：  滑鼠點底部 [ROS] / [AI] tab
-#  切換 pane：    滑鼠點擊
-#  全螢幕 pane：  Ctrl+b, z（再按還原）
-#  關閉單一 pane：Ctrl+b, x → 按 y
-#  關閉整個系統： 滑鼠點右下角 [ ✕ 關閉系統 ]  或  Ctrl+b, Q
-# ─────────────────────────────────────────────────────────
+# 已暫停使用：目前改採手動分開啟動各節點，避免 ROS master / MoveIt 啟動時序不一致。
+
+echo "start_grasp.sh 目前已停用。"
+echo "請改用手動啟動流程，並視需要先載入："
+echo "  rosparam load ~/handeye_ws/src/ur3_handover/config/handover_params.yaml"
+echo "手動流程請參考 note.md / hackmd.md。"
+exit 1
 
 if ! command -v tmux &>/dev/null; then
     echo "tmux 未安裝，請先執行：sudo apt-get install -y tmux"
@@ -18,6 +15,7 @@ fi
 SESSION="grasp"
 WS="$HOME/handeye_ws"
 CONDA_INIT="source $HOME/miniconda3/etc/profile.d/conda.sh"
+HANDOVER_PARAM_FILE="$WS/src/ur3_handover/config/handover_params.yaml"
 
 if tmux has-session -t $SESSION 2>/dev/null; then
     echo "Session '$SESSION' 已在運行，直接連入..."
@@ -61,23 +59,26 @@ tmux set-option -p -t "$P_TF"  @label "📐 TF 外參"
 tmux send-keys -t "$P_CAM" "cd $WS && source devel/setup.bash && roslaunch realsense2_camera rs_camera.launch align_depth:=true" Enter
 tmux send-keys -t "$P_ARM" "cd $WS && source devel/setup.bash && roslaunch ur_robot_driver ur3_bringup.launch robot_ip:=192.168.86.7" Enter
 tmux send-keys -t "$P_MOV" "cd $WS && source devel/setup.bash && sleep 5 && roslaunch ur3_moveit_config moveit_planning_execution.launch limited:=true" Enter
-tmux send-keys -t "$P_TF"  "cd $WS && source devel/setup.bash && sleep 8 && roslaunch easy_handeye publish.launch eye_on_hand:=false namespace_prefix:=ur3_realsense_handeyecalibration_eye_on_base robot_base_frame:=base_link tracking_base_frame:=camera_color_optical_frame calibration_file:=\$HOME/.ros/easy_handeye/ur3_realsense_handeyecalibration_eye_on_base.yaml" Enter
+tmux send-keys -t "$P_TF"  "cd $WS && source devel/setup.bash && rosparam load $HANDOVER_PARAM_FILE && sleep 8 && roslaunch easy_handeye publish.launch eye_on_hand:=false namespace_prefix:=ur3_realsense_handeyecalibration_eye_on_base robot_base_frame:=base_link tracking_base_frame:=camera_color_optical_frame calibration_file:=\$HOME/.ros/easy_handeye/ur3_realsense_handeyecalibration_eye_on_base.yaml" Enter
 
 # ── Window 1: AI 管線 ─────────────────────────────────────
 P_RVIZ=$(tmux new-window   -t $SESSION -n "AI" -P -F '#{pane_id}')
 P_BRAIN=$(tmux split-window -h -t "$P_RVIZ"    -P -F '#{pane_id}')
 P_CTRL=$( tmux split-window -v -t "$P_RVIZ"    -P -F '#{pane_id}')
 P_CLI=$(  tmux split-window -v -t "$P_BRAIN"   -P -F '#{pane_id}')
+P_HAND=$( tmux split-window -h -t "$P_CTRL"    -P -F '#{pane_id}')
 
 tmux set-option -p -t "$P_RVIZ"  @label "👁  RViz"
 tmux set-option -p -t "$P_BRAIN" @label "🤖 brain_node"
 tmux set-option -p -t "$P_CTRL"  @label "🎮 controller"
 tmux set-option -p -t "$P_CLI"   @label "📸 client_camera"
+tmux set-option -p -t "$P_HAND"  @label "🤚 handover"
 
 tmux send-keys -t "$P_RVIZ"  "cd $WS && source devel/setup.bash && sleep 10 && rosrun rviz rviz -d $WS/anygrasp_debug.rviz" Enter
 tmux send-keys -t "$P_BRAIN" "cd $WS && source devel/setup.bash && sleep 10 && $CONDA_INIT && conda activate grasp-py310 && python3 src/ur3_handover/scripts/brain_node.py" Enter
 tmux send-keys -t "$P_CTRL"  "cd $WS && source devel/setup.bash && sleep 12 && $CONDA_INIT && conda activate anygrasp && rosrun ur3_handover semantic_grasp_controller.py" Enter
 tmux send-keys -t "$P_CLI"   "cd $WS/src/ur3_handover/scripts && source $WS/devel/setup.bash && sleep 15 && $CONDA_INIT && conda activate anygrasp && python3 client_camera.py" Enter
+tmux send-keys -t "$P_HAND"  "cd $WS && source devel/setup.bash && sleep 14 && rosrun ur3_handover handover_perception.py" Enter
 
 tmux select-window -t $SESSION:0
 tmux attach -t $SESSION

@@ -14,11 +14,20 @@
 | 6 | AI 大腦 | `conda activate grasp-py310 && rosrun ur3_handover brain_node.py` |
 | 7 | 機械臂控制器 | `conda activate anygrasp && rosrun ur3_handover semantic_grasp_controller.py` |
 | 8 | 視覺前端 | `conda activate anygrasp && python3 client_camera.py` |
+| 9 | Handover 感知 | `rosrun ur3_handover handover_perception.py` |
 
 **前置確認**
 - UR3 IP `192.168.86.7` 可 ping 通
 - Ngrok 已啟動：`ngrok tcp 5555`，並更新 `client_camera.py` 第 26 行的 server 地址
 - 外參檔存在：`~/.ros/easy_handeye/ur3_realsense_handeyecalibration_eye_on_base.yaml`
+- `handover_perception.py` 請直接用系統 Python 跑，不要在 conda 環境下啟動
+- handover 區域、手心偏移與力矩釋放門檻統一改 `src/ur3_handover/config/handover_params.yaml`
+- `start_grasp.sh` 目前已停用，抓取流程改成手動分開啟動各節點
+
+```bash
+# 手動啟動節點前若要套用 handover 參數
+rosparam load /home/weilun/handeye_ws/src/ur3_handover/config/handover_params.yaml
+```
 
 ---
 

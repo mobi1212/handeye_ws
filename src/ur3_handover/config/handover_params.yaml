@@ -1,0 +1,34 @@
+# handover 參數說明
+# 1. 這份檔案給 handover_perception.py 和 semantic_grasp_controller.py 共用。
+# 2. 修改後直接存檔即可，節點會自動重載，不需要手動 rosparam load。
+# 3. 最常改的是：
+#    - handover_zone_center_xyz: 交接區中心
+#    - handover_zone_half_extents_xyz: 交接區半長寬高
+#    - handover_object_offset_xyz: 物體相對手心的偏移
+#    - force_release_threshold: 力矩放手門檻
+#    - handover_zone_visible / handover_zone_color_rgba: RViz 交接區顯示樣式
+semantic_handover:
+  hand_state_topic: /semantic_handover/hand_state
+  marker_topic: /semantic_handover/markers
+  user_cmd_topic: /semantic_handover/user_cmd
+
+  use_dynamic_handover: true
+  handover_object_offset_xyz: [0.0, 0.0, 0.0]
+
+  # Edit these on site to tune the handover zone quickly.
+  handover_zone_center_xyz: [0.25, 0.28, 0.15]
+  handover_zone_half_extents_xyz: [0.10, 0.20, 0.08]
+  handover_zone_visible: true
+  handover_zone_color_rgba: [0.1, 0.5, 1.0, 0.5]
+
+  process_hz: 8.0
+  depth_sample_radius_px: 6
+  min_valid_depth_m: 0.15
+  max_valid_depth_m: 1.20
+  stability_window: 5
+  stability_pos_threshold: 0.03
+  hand_state_stability_threshold: 0.85
+  handover_hand_timeout: 10.0
+
+  force_release_threshold: 10.0
+  force_release_timeout: 30.0

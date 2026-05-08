@@ -9,6 +9,7 @@ catkin_install_python(
   PROGRAMS
     scripts/brain_node.py
     scripts/client_camera.py
+    scripts/handover_perception.py
     scripts/semantic_grasp_controller.py
     scripts/robotiq_gripper.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}

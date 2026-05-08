@@ -149,9 +149,12 @@ camera_color_optical_frame → ...        （RealSense 內部，publish_tf=false
 | `client_camera.py` | `anygrasp` | 3.8 | ZMQ + ROS + SVD |
 | `semantic_grasp_controller.py` | `anygrasp` | 3.8 | MoveIt + TF + 夾爪 |
 | `brain_node.py` | `grasp-py310` | 3.10 | OWL-v2 + SAM + Gemini |
+| `handover_perception.py` | system python | 3.8 | MediaPipe Hands + PyKDL + TF + RViz markers |
 | `server_anygrasp.py` | AI Server | 3.10 | 遠端 GPU 推論 |
 
 > `brain_node.py` 透過 `sys.path` 手動載入 `/opt/ros/noetic`，不依賴 conda 內的 ROS。
+> `handover_perception.py` 依賴系統 Python 3.8 下的 `mediapipe`、`PyKDL` 與 ROS Python 套件，因此固定以系統 Python 啟動，不放入 conda 環境。
+> handover 區域、手心偏移與力矩釋放門檻集中在 `src/ur3_handover/config/handover_params.yaml`。目前 `start_grasp.sh` 已停用，請在手動啟動節點前先自行 `rosparam load`。
 
 ---
 
@@ -166,7 +169,7 @@ camera_color_optical_frame → ...        （RealSense 內部，publish_tf=false
 | 關節超出界限自動 normalize | ✅ | wrist_3 > 2π 不再卡住 |
 | 抓取後垂直抬升 | ✅ | Z+0.05m 取代沿抓取軸後退 |
 | 套件改名 ur3_click2pick → ur3_handover | ✅ | 反映最終 human handover 目標 |
-| tmux 一鍵啟動腳本 | ✅ | start_grasp.sh / start_calibration.sh |
+| tmux 一鍵啟動腳本 | ⚠️ | `start_calibration.sh` 可用；`start_grasp.sh` 目前停用，抓取流程改手動啟動 |
 | 目標區域點雲密度增加 | ✅ | server_anygrasp.py，深度圖插值 2x，見下方說明 |
 | AnyGrasp 受 mask 約束 | ⬜ | 目前只傳 bbox，AnyGrasp 可能選到 mask 外 |
 | VLM pipeline 移至遠端 server | ⬜ | 計劃書：SERVER_UPGRADE_PLAN.md，待桌機端實作 |

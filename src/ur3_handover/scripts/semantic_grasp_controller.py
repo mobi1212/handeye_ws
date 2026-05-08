@@ -7,6 +7,7 @@ Semantic Grasp Controller (AnyGrasp 6D Pose 接收版)
 import json
 import os, sys, math, numpy as np
 import traceback
+import yaml
 # 確保從 scripts 目錄直接載入，避免 catkin relay exec() 的 import 問題
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rospy
@@ -23,33 +24,68 @@ from robotiq_gripper import RobotiqGripper
 class SemanticGraspController:
     def __init__(self):
         # ---- 1. 參數 ----
-        self.base_frame  = rospy.get_param("~base_frame", "base_link")
-        self.move_group  = rospy.get_param("~move_group", "manipulator")
-        self.use_grasp_metadata = bool(rospy.get_param("~use_grasp_metadata", True))
-        self.prefer_camera_facing_side = bool(rospy.get_param("~prefer_camera_facing_side", True))
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        ws_root = os.path.abspath(os.path.join(script_dir, "..", "..", ".."))
+        default_config_path = os.path.join(ws_root, "src", "ur3_handover", "config", "handover_params.yaml")
+
+        self.base_frame  = self._get_param("~base_frame", None, "base_link")
+        self.move_group  = self._get_param("~move_group", None, "manipulator")
+        self.use_grasp_metadata = bool(self._get_param("~use_grasp_metadata", None, True))
+        self.prefer_camera_facing_side = bool(
+            self._get_param("~prefer_camera_facing_side", None, True))
         self.use_server_depth_for_offset = bool(
-            rospy.get_param("~use_server_depth_for_offset", False))
-        self.prefer_nearest_ik = bool(rospy.get_param("~prefer_nearest_ik", True))
+            self._get_param("~use_server_depth_for_offset", None, False))
+        self.prefer_nearest_ik = bool(self._get_param("~prefer_nearest_ik", None, True))
 
-        self.tcp_offset    = float(rospy.get_param("~tcp_offset",    0.16))
-        self.grasp_depth   = float(rospy.get_param("~grasp_depth",   0.05))
-        self.approach_dist = float(rospy.get_param("~approach_dist", 0.05))
+        self.tcp_offset    = float(self._get_param("~tcp_offset", None, 0.16))
+        self.grasp_depth   = float(self._get_param("~grasp_depth", None, 0.05))
+        self.approach_dist = float(self._get_param("~approach_dist", None, 0.05))
 
-        self.retreat_up_height = float(rospy.get_param("~retreat_up_height", 0.14))  # 待機點高度
+        self.retreat_up_height = float(self._get_param("~retreat_up_height", None, 0.14))  # 待機點高度
 
-        self.eef_step  = float(rospy.get_param("~eef_step",  0.02))
-        self.vel_scale = float(rospy.get_param("~vel_scale", 0.10))
-        self.acc_scale = float(rospy.get_param("~acc_scale", 0.10))
+        self.eef_step  = float(self._get_param("~eef_step", None, 0.02))
+        self.vel_scale = float(self._get_param("~vel_scale", None, 0.10))
+        self.acc_scale = float(self._get_param("~acc_scale", None, 0.10))
 
+        self.use_dynamic_handover = bool(self._get_param(
+            "~use_dynamic_handover", "/semantic_handover/use_dynamic_handover", True))
         # 固定交接點（物體位置，即指尖/TCP 位置，非 tool0）
-        self.handover_object_xyz = rospy.get_param("~handover_object_xyz", [0.1606, 0.2881, 0.1554])
+        self.handover_object_xyz = self._get_param(
+            "~handover_object_xyz", None, [0.1606, 0.2881, 0.1554])
+        self.handover_object_offset_xyz = np.array(
+            self._get_param(
+                "~handover_object_offset_xyz",
+                "/semantic_handover/handover_object_offset_xyz",
+                [0.0, 0.0, 0.0]),
+            dtype=float)
         # 待機點（tool0 位置，固定姿態）
-        self.ready_xyz = rospy.get_param("~ready_xyz", [-0.2456, 0.2653, 0.2889])
+        self.ready_xyz = self._get_param("~ready_xyz", None, [-0.2456, 0.2653, 0.2889])
+        self.hand_state_topic = self._get_param(
+            "~hand_state_topic", "/semantic_handover/hand_state_topic",
+            "/semantic_handover/hand_state")
+        self.user_cmd_topic = self._get_param(
+            "~user_cmd_topic", "/semantic_handover/user_cmd_topic",
+            "/semantic_handover/user_cmd")
+        self.hand_state_stability_threshold = float(
+            self._get_param(
+                "~hand_state_stability_threshold",
+                "/semantic_handover/hand_state_stability_threshold",
+                0.85))
+        self.hand_state_max_age = float(self._get_param("~hand_state_max_age", None, 0.50))
+        self.handover_hand_timeout = float(self._get_param(
+            "~handover_hand_timeout", "/semantic_handover/handover_hand_timeout", 10.0))
         # 力矩偵測參數
-        self.handover_force_threshold = float(rospy.get_param("~handover_force_threshold", 10.0))
-        self.handover_timeout = float(rospy.get_param("~handover_timeout", 30.0))
+        self.handover_force_threshold = float(self._get_param(
+            "~handover_force_threshold", "/semantic_handover/force_release_threshold", 10.0))
+        self.handover_timeout = float(self._get_param(
+            "~handover_timeout", "/semantic_handover/force_release_timeout", 30.0))
+        self.handover_config_path = self._get_param(
+            "~handover_config_path", None, default_config_path)
+        self._handover_config_mtime = None
         # wrench 即時值
         self._wrench_force = np.zeros(3)
+        self._latest_hand_state = None
+        self._abort_requested = False
 
         # 夾爪
         self.grip_ip    = rospy.get_param("~gripper_ip",   "192.168.86.7")
@@ -71,7 +107,7 @@ class SemanticGraspController:
 
         self.tfbuf = tf2_ros.Buffer(cache_time=rospy.Duration(10.0))
         self.tflis = tf2_ros.TransformListener(self.tfbuf)
-        self.ik_service_name = rospy.get_param("~ik_service", "/compute_ik")
+        self.ik_service_name = self._get_param("~ik_service", None, "/compute_ik")
         self.ik_srv = None
         if self.prefer_nearest_ik:
             try:
@@ -82,8 +118,10 @@ class SemanticGraspController:
                 rospy.logwarn("[p2p] 找不到 IK service %s，退回 pose target 規劃",
                               self.ik_service_name)
 
-        self.target_pose_topic = rospy.get_param("~target_pose_topic", "/anygrasp/target_pose")
-        self.target_grasp_topic = rospy.get_param("~target_grasp_topic", "/anygrasp/target_grasp")
+        self.target_pose_topic = self._get_param(
+            "~target_pose_topic", None, "/anygrasp/target_pose")
+        self.target_grasp_topic = self._get_param(
+            "~target_grasp_topic", None, "/anygrasp/target_grasp")
 
         # 訂閱 AnyGrasp 姿態 / 完整 grasp metadata
         if self.use_grasp_metadata:
@@ -98,9 +136,17 @@ class SemanticGraspController:
         rospy.Subscriber("/semantic_grasp/go_home", String, self._cb_go_home)
         # TCP 力矩
         rospy.Subscriber("/wrench", WrenchStamped, self._wrench_cb)
+        rospy.Subscriber(self.hand_state_topic, String, self._hand_state_cb, queue_size=1)
+        rospy.Subscriber(self.user_cmd_topic, String, self._user_cmd_cb, queue_size=1)
 
         rospy.loginfo("[p2p] 啟動完成，等待目標姿態...")
         rospy.loginfo("[p2p] 隨時回待機點: rostopic pub /semantic_grasp/go_home std_msgs/String 'go' -1")
+        rospy.loginfo(
+            "[p2p] handover mode=%s, hand_state=%s, user_cmd=%s",
+            "dynamic" if self.use_dynamic_handover else "static",
+            self.hand_state_topic,
+            self.user_cmd_topic)
+        self._reload_handover_config_if_needed(force=True)
 
     # ------------------------------------------------------------------ #
     #  ROS callbacks                                                       #
@@ -233,6 +279,84 @@ class SemanticGraspController:
     def _cb_go_home(self, msg):
         rospy.loginfo("[p2p] 收到回待機點指令...")
         self.go_to_ready_pose()
+
+    def _get_param(self, private_name, shared_name, default):
+        if private_name and rospy.has_param(private_name):
+            return rospy.get_param(private_name)
+        if shared_name and rospy.has_param(shared_name):
+            return rospy.get_param(shared_name)
+        return default
+
+    def _load_handover_config(self):
+        if not self.handover_config_path or not os.path.exists(self.handover_config_path):
+            return None
+        try:
+            with open(self.handover_config_path, "r", encoding="utf-8") as fh:
+                payload = yaml.safe_load(fh) or {}
+        except Exception as exc:
+            rospy.logwarn_throttle(5.0, "[p2p] 讀取 handover config 失敗: %s", exc)
+            return None
+        data = payload.get("semantic_handover")
+        return data if isinstance(data, dict) else None
+
+    def _reload_handover_config_if_needed(self, force=False):
+        if not self.handover_config_path or not os.path.exists(self.handover_config_path):
+            return
+        try:
+            mtime = os.path.getmtime(self.handover_config_path)
+        except OSError:
+            return
+        if not force and self._handover_config_mtime == mtime:
+            return
+
+        cfg = self._load_handover_config()
+        if cfg is None:
+            return
+
+        self.use_dynamic_handover = bool(cfg.get("use_dynamic_handover", self.use_dynamic_handover))
+        self.handover_object_offset_xyz = np.array(
+            cfg.get("handover_object_offset_xyz", self.handover_object_offset_xyz.tolist()),
+            dtype=float,
+        )
+        self.hand_state_stability_threshold = float(
+            cfg.get("hand_state_stability_threshold", self.hand_state_stability_threshold))
+        self.handover_hand_timeout = float(
+            cfg.get("handover_hand_timeout", self.handover_hand_timeout))
+        self.handover_force_threshold = float(
+            cfg.get("force_release_threshold", self.handover_force_threshold))
+        self.handover_timeout = float(
+            cfg.get("force_release_timeout", self.handover_timeout))
+        self._handover_config_mtime = mtime
+        rospy.loginfo(
+            "[p2p] 已重載 handover config: dynamic=%s offset=%s force_threshold=%.2f timeout=%.1f",
+            self.use_dynamic_handover,
+            self.handover_object_offset_xyz.tolist(),
+            self.handover_force_threshold,
+            self.handover_timeout,
+        )
+
+    def _hand_state_cb(self, msg: String):
+        try:
+            self._latest_hand_state = json.loads(msg.data)
+        except json.JSONDecodeError:
+            rospy.logwarn_throttle(2.0, "[p2p] hand_state JSON 解析失敗: %s", msg.data)
+
+    def _user_cmd_cb(self, msg: String):
+        try:
+            payload = json.loads(msg.data)
+        except json.JSONDecodeError:
+            rospy.logwarn_throttle(2.0, "[p2p] user_cmd JSON 解析失敗: %s", msg.data)
+            return
+
+        cmd = str(payload.get("cmd", "")).strip().lower()
+        if cmd == "abort":
+            self._abort_requested = True
+            rospy.logwarn("[p2p] 收到 abort 指令")
+        elif cmd == "resume":
+            self._abort_requested = False
+            rospy.loginfo("[p2p] 收到 resume 指令，已清除 handover command state")
+        elif cmd == "release":
+            rospy.logwarn("[p2p] 目前設定為純力矩釋放，忽略 release 指令")
 
     # ------------------------------------------------------------------ #
     #  Helpers                                                             #
@@ -461,7 +585,98 @@ class SemanticGraspController:
         f = msg.wrench.force
         self._wrench_force = np.array([f.x, f.y, f.z])
 
+    def _reset_handover_command_state(self):
+        self._abort_requested = False
+
+    def _get_recent_hand_state(self):
+        state = self._latest_hand_state
+        if not isinstance(state, dict):
+            return None
+
+        try:
+            stamp_sec = float(state.get("stamp", 0.0))
+        except (TypeError, ValueError):
+            return None
+        if stamp_sec <= 0.0:
+            return None
+
+        age = rospy.Time.now().to_sec() - stamp_sec
+        if age > self.hand_state_max_age:
+            return None
+        return state
+
+    def _is_hand_state_stable(self, state):
+        if not isinstance(state, dict):
+            return False
+        if not bool(state.get("valid", False)):
+            return False
+        if not bool(state.get("in_zone", False)):
+            return False
+        palm_center = state.get("palm_center_3d")
+        if not isinstance(palm_center, (list, tuple)) or len(palm_center) != 3:
+            return False
+        try:
+            stability = float(state.get("stability", 0.0))
+        except (TypeError, ValueError):
+            return False
+        return stability >= self.hand_state_stability_threshold
+
+    def _wait_for_stable_hand_sample(self):
+        self._reload_handover_config_if_needed()
+        rospy.loginfo(
+            "[p2p] 等待穩定手位（threshold=%.2f, timeout=%.1fs, topic=%s）...",
+            self.hand_state_stability_threshold,
+            self.handover_hand_timeout,
+            self.hand_state_topic)
+        t0 = rospy.Time.now().to_sec()
+        rate = rospy.Rate(10)
+        while rospy.Time.now().to_sec() - t0 < self.handover_hand_timeout:
+            if self._abort_requested:
+                rospy.logwarn("[p2p] handover 在取樣手位前被 abort")
+                return None, None
+
+            state = self._get_recent_hand_state()
+            if self._is_hand_state_stable(state):
+                hand_xyz = np.array(state["palm_center_3d"], dtype=float)
+                rospy.loginfo(
+                    "[p2p] 取得穩定手位 xyz=(%.3f, %.3f, %.3f), stability=%.2f",
+                    hand_xyz[0], hand_xyz[1], hand_xyz[2], float(state.get("stability", 0.0)))
+                return hand_xyz, state
+
+            rospy.loginfo_throttle(2.0, "[p2p] 等待手進入交接區並穩定...")
+            rate.sleep()
+
+        rospy.logwarn("[p2p] 等待穩定手位逾時（%.1fs）", self.handover_hand_timeout)
+        return None, None
+
+    def resolve_handover_pose(self, grasp_pose, ee_z):
+        if not self.use_dynamic_handover:
+            handover_object_xyz = np.array(self.handover_object_xyz, dtype=float)
+            handover_tool0_xyz = handover_object_xyz - ee_z * self.tcp_offset
+            ps_handover = self.make_pose_stamped(
+                handover_tool0_xyz, grasp_pose.pose.orientation)
+            rospy.loginfo(
+                "[p2p] 使用固定交接點 object=(%.3f, %.3f, %.3f)",
+                *handover_object_xyz)
+            return ps_handover, handover_object_xyz, None
+
+        palm_xyz, hand_state = self._wait_for_stable_hand_sample()
+        if palm_xyz is None:
+            return None, None, None
+
+        handover_object_xyz = palm_xyz + self.handover_object_offset_xyz
+        handover_tool0_xyz = handover_object_xyz - ee_z * self.tcp_offset
+        ps_handover = self.make_pose_stamped(handover_tool0_xyz, grasp_pose.pose.orientation)
+        rospy.loginfo("[p2p] hand palm xyz    = (%.3f, %.3f, %.3f)", *palm_xyz)
+        rospy.loginfo(
+            "[p2p] handover offset  = (%.3f, %.3f, %.3f)",
+            *self.handover_object_offset_xyz)
+        rospy.loginfo("[p2p] handover object = (%.3f, %.3f, %.3f)", *handover_object_xyz)
+        rospy.loginfo("[p2p] handover tool0  = (%.3f, %.3f, %.3f)", *handover_tool0_xyz)
+        return ps_handover, handover_object_xyz, hand_state
+
     def _measure_wrench_baseline(self, duration=0.5):
+        self._reload_handover_config_if_needed()
         samples = []
         t0 = rospy.Time.now().to_sec()
         rate = rospy.Rate(20)
@@ -473,6 +688,7 @@ class SemanticGraspController:
         return baseline
 
     def _wait_for_handover(self, baseline):
+        self._reload_handover_config_if_needed()
         rospy.loginfo("[p2p] 等待人手接取（threshold=%.1f N, timeout=%.0fs）...",
                       self.handover_force_threshold, self.handover_timeout)
         t0 = rospy.Time.now().to_sec()
@@ -480,6 +696,9 @@ class SemanticGraspController:
         CONFIRM_COUNT = 1  # 連續 2 次即觸發
         confirm = 0
         while rospy.Time.now().to_sec() - t0 < self.handover_timeout:
+            if self._abort_requested:
+                rospy.logwarn("[p2p] handover 被 abort，保持夾持")
+                return False
             delta = abs(np.linalg.norm(self._wrench_force) - baseline)
             if delta > self.handover_force_threshold:
                 confirm += 1
@@ -489,7 +708,7 @@ class SemanticGraspController:
             else:
                 confirm = 0
             rate.sleep()
-        rospy.logwarn("[p2p] 交接逾時（%.0fs），自動鬆手", self.handover_timeout)
+        rospy.logwarn("[p2p] 交接逾時（%.0fs），保持夾持", self.handover_timeout)
         return False
 
     def init_gripper(self):
@@ -538,6 +757,7 @@ class SemanticGraspController:
             self._prompt_ready()
 
     def _grasp_and_place(self, ps_target, final_insert_depth=None, server_depth=None):
+        self._reset_handover_command_state()
         final_insert_depth = (
             self.grasp_depth if final_insert_depth is None else float(final_insert_depth))
         ps_grasp, ps_pre, grasp_info = self.build_robot_grasp_poses(
@@ -554,12 +774,6 @@ class SemanticGraspController:
             grasp_info["final_insert_depth"], self.tcp_offset, self.approach_dist)
         rospy.loginfo("[p2p] final_grasp_xyz = (%.3f, %.3f, %.3f)", *grasp_info["final_grasp_xyz"])
         rospy.loginfo("[p2p] pregrasp_xyz    = (%.3f, %.3f, %.3f)", *grasp_info["pregrasp_xyz"])
-
-        # 交接點：物體要在 handover_object_xyz，反推 tool0 位置
-        handover_tool0_xyz = np.array(self.handover_object_xyz) - ee_z * self.tcp_offset
-        ps_handover = self.make_pose_stamped(handover_tool0_xyz, ps_target.pose.orientation)
-        rospy.loginfo("[p2p] handover object  = (%.3f, %.3f, %.3f)", *self.handover_object_xyz)
-        rospy.loginfo("[p2p] handover tool0   = (%.3f, %.3f, %.3f)", *handover_tool0_xyz)
 
         # ── 動作 A：Pre-Grasp（規劃 → 確認迴圈）────────────────────────── #
         while True:
@@ -607,17 +821,30 @@ class SemanticGraspController:
             ps_grasp.pose.orientation)
         if not self.plan_execute_cartesian_to(lift_pose): return
 
+        # ── 動作 E：解析交接點（固定區內手位穩定取樣）────────────────── #
+        ps_handover, handover_object_xyz, _ = self.resolve_handover_pose(ps_target, ee_z)
+        if ps_handover is None:
+            rospy.logwarn("[p2p] 找不到可用交接手位，保持夾持並中止交接")
+            return
+
         # ── 動作 E：關節規劃 → 交接點（保持抓取姿態）───────────────────── #
         rospy.loginfo("[p2p] 移動至交接點 object=%s, tool0=%s ...",
-                      self.handover_object_xyz, handover_tool0_xyz.tolist())
+                      handover_object_xyz.tolist(),
+                      [
+                          ps_handover.pose.position.x,
+                          ps_handover.pose.position.y,
+                          ps_handover.pose.position.z,
+                      ])
         ok, _ = self.joint_plan_execute(ps_handover, "交接點")
         if not ok: return
 
-        # ── 動作 F：記錄 baseline → 等人拉 → 鬆手 ───────────────────────── #
-        rospy.loginfo("[p2p] 到達交接點，等待穩定...")
+        # ── 動作 F：等待力矩觸發交接 ────────────────────────────────────── #
+        rospy.loginfo("[p2p] 到達交接點，等待力矩觸發放手...")
         rospy.sleep(1.0)  # 等手臂震動消散
         baseline = self._measure_wrench_baseline(duration=1.0)
-        self._wait_for_handover(baseline)
+        if not self._wait_for_handover(baseline):
+            rospy.logwarn("[p2p] 未偵測到有效交接拉力，保持夾持")
+            return
 
         # ── 動作 G：張開夾爪 ────────────────────────────────────────────── #
         if self.g: self.g.move_and_wait_for_pos(0, self.grip_speed, self.grip_force)
