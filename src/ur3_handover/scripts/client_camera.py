@@ -26,14 +26,16 @@ from std_msgs.msg import String
 # from cv_bridge import CvBridge, CvBridgeError
 from tf.transformations import quaternion_from_matrix
 
-ZMQ_RECV_TIMEOUT_MS = 30000  # 30 秒無回應則放棄
+ZMQ_RECV_TIMEOUT_MS = 60000  # 30 秒無回應則放棄
 
 class AnyGraspROSClient:
     def __init__(self):
         rospy.init_node('anygrasp_ros_client', anonymous=True)
+        self.use_moveit = bool(rospy.get_param('~use_moveit', False))
 
         # --- 參數設定 ---
-        self.server_addr = "tcp://0.tcp.jp.ngrok.io:16030" # ⚠️ 請更新 Ngrok 網址
+        # self.server_addr = "tcp://140.124.181.184:5555"
+        self.server_addr = "tcp://0.tcp.jp.ngrok.io:11541" # ⚠️ 請更新 Ngrok 網址
 
         # --- 1. 初始化 ZMQ ---
         self.context = zmq.Context()
@@ -55,13 +57,10 @@ class AnyGraspROSClient:
         self.cv_depth = None
         self.manual_bbox = None
 
-        # --- 3. VLM+SAM 模式 ---
+        # --- 3. 目標模式 ---
         self.vlm_target = None
         self.last_vlm_target = None   # 上一次輸入的物件名稱
-        self.brain_result = None
-        self.vlm_mask_path = "/tmp/semantic_brain/target_mask.png"
-        self.brain_trigger_pub = rospy.Publisher("/system/trigger_llm", String, queue_size=1)
-        rospy.Subscriber("/system/llm_done", String, self._brain_done_callback)
+        self.last_vlm_result = None   # 上一次完整 VLM 結果，供 [s] 只重算 AnyGrasp
 
         # --- 相機內參 ---
         self.fx = None
@@ -76,32 +75,20 @@ class AnyGraspROSClient:
         self.send_count = 0         # 累計發送次數（供顯示）
         self.ar_overlay_img = None  # 抓取結果 AR 疊加圖（靜態，直到下一次結果覆蓋）
 
-        if MOVEIT_AVAILABLE:
+        if MOVEIT_AVAILABLE and self.use_moveit:
             self.scene = moveit_commander.PlanningSceneInterface()
             self.add_virtual_table()
+        elif MOVEIT_AVAILABLE:
+            print("ℹ️  已跳過 MoveIt 初始化（~use_moveit:=false），可直接做無手臂測試。")
 
         print("✅ ROS 節點已啟動，等待影像輸入...")
         print("-" * 50)
-        print("👉 [v] : VLM+SAM 模式（輸入文字描述目標物）")
+        print("👉 [v] : VLM 模式（直接送目標名稱到遠端 server）")
         print("👉 [r] : 手動框選物體")
-        print("👉 [s] : 重新發送當前遮罩給 AnyGrasp（重算抓取姿態）")
+        print("👉 [s] : 重新發送目前目標給 AnyGrasp（重算抓取姿態）")
         print("👉 [c] : 清除 / 重置")
         print("👉 [q] : 退出")
         print("-" * 50)
-
-    def _brain_done_callback(self, msg):
-        try:
-            self.brain_result = json.loads(msg.data)
-            status = self.brain_result.get("status", "unknown")
-            if status == "done":
-                grids = self.brain_result.get("target_grids", [])
-                print(f"\n✅ Brain node 完成！抓取格子: {grids}，準備自動發送...")
-                self.send_done = False  # 觸發自動發送
-            else:
-                reason = self.brain_result.get("reason", "unknown")
-                print(f"\n❌ Brain node 失敗: {reason}")
-        except json.JSONDecodeError:
-            print(f"\n❌ Brain node 回傳格式錯誤: {msg.data}")
 
     def camera_info_callback(self, msg):
         if self.fx is None:
@@ -145,8 +132,9 @@ class AnyGraspROSClient:
             display_img = self.cv_color.copy()
             best_bbox = None
             best_mask = None
-            svd_mask = None
             cls_name = "None"
+            current_mode = None
+            can_reuse_vlm = False
 
             # --- 模式 1：手動框選 ---
             if self.manual_bbox is not None:
@@ -154,29 +142,30 @@ class AnyGraspROSClient:
                 best_bbox = self.manual_bbox
                 best_mask = None
                 cls_name = "manual_item"
+                current_mode = "roi"
 
-            # --- 模式 2：VLM+SAM（結果已就緒）---
-            elif self.vlm_target and self.brain_result and self.brain_result.get("status") == "done":
-                if os.path.exists(self.vlm_mask_path):
-                    mask_img = cv2.imread(self.vlm_mask_path, cv2.IMREAD_GRAYSCALE)
-                    if mask_img is not None:
-                        best_mask = (mask_img > 127).astype(np.float32)
-                        ys, xs = np.where(mask_img > 127)
-                        if len(xs) > 0:
-                            best_bbox = [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
-                            cls_name = self.vlm_target
-
-                full_mask_path = "/tmp/semantic_brain/sam_global_mask_full.png"
-                if os.path.exists(full_mask_path):
-                    full_mask_img = cv2.imread(full_mask_path, cv2.IMREAD_GRAYSCALE)
-                    if full_mask_img is not None:
-                        svd_mask = (full_mask_img > 127).astype(np.float32)
-
-            # --- VLM 等待中 ---
-            elif self.vlm_target and (self.brain_result is None or
-                    self.brain_result.get("status") not in ("done", "fail")):
-                cv2.putText(display_img, f"VLM: processing '{self.vlm_target}'...",
-                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+            # --- 模式 2：VLM 直接送到遠端 server ---
+            elif self.vlm_target:
+                cls_name = self.vlm_target
+                current_mode = "vlm"
+                if self.last_vlm_result and self.last_vlm_result.get("object_name") == self.vlm_target:
+                    best_bbox = self.last_vlm_result.get("bbox")
+                    cached_mask = self.last_vlm_result.get("mask")
+                    if cached_mask is not None:
+                        best_mask = cached_mask
+                    can_reuse_vlm = True
+                status_text = f"VLM target: '{self.vlm_target}'"
+                if self.sending:
+                    status_text += " (sending...)"
+                elif self.send_done:
+                    if can_reuse_vlm:
+                        status_text += f" (sent x{self.send_count}) [s]=regrasp"
+                    else:
+                        status_text += f" (sent x{self.send_count})"
+                else:
+                    status_text += " (ready)"
+                cv2.putText(display_img, status_text,
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2)
 
             # --- 無目標：顯示待機畫面 ---
             else:
@@ -196,16 +185,18 @@ class AnyGraspROSClient:
                 box_color = (0, 200, 0) if self.send_done else (0, 255, 0)
                 cv2.rectangle(display_img, (x1, y1), (x2, y2), box_color, 2)
                 label = cls_name
-                if self.send_done:
-                    label += f" (sent x{self.send_count}) [s]=resend"
+                if self.send_done and current_mode == "vlm" and can_reuse_vlm:
+                    label += f" (sent x{self.send_count}) [s]=regrasp"
+                elif self.send_done:
+                    label += f" (sent x{self.send_count})"
                 cv2.putText(display_img, label, (x1, max(0, y1-10)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
 
-            # --- 首次自動發送（遮罩就緒且尚未發送過）---
-            if (best_bbox is not None and self.fx is not None
+            # --- 首次自動發送（目標就緒且尚未發送過）---
+            if (current_mode is not None and self.fx is not None
                     and not self.sending and not self.send_done
                     and self.cv_depth is not None):
-                self._trigger_send(best_mask, svd_mask, best_bbox, cls_name)
+                self._trigger_send(current_mode, best_mask, best_bbox, cls_name)
 
             # --- 狀態提示（左側即時畫面）---
             h_img, w_img = display_img.shape[:2]
@@ -244,13 +235,11 @@ class AnyGraspROSClient:
                 if prompt:
                     self.last_vlm_target = prompt
                     self.vlm_target = prompt
-                    self.brain_result = None
                     self.manual_bbox = None
                     self.send_done = False
                     self.send_count = 0
                     self.ar_overlay_img = None
-                    self.brain_trigger_pub.publish(json.dumps({"object_name": prompt}))
-                    print(f"⚡ 已發送 trigger，等待 brain node 處理 '{prompt}'...")
+                    print(f"⚡ 已鎖定 VLM 目標 '{prompt}'，準備直接送往遠端 server...")
 
             # [r] 手動框選
             if key & 0xFF == ord('r'):
@@ -261,29 +250,31 @@ class AnyGraspROSClient:
                     x, y, w, h = map(int, roi)
                     self.manual_bbox = [x, y, x+w, y+h]
                     self.vlm_target = None
-                    self.brain_result = None
                     self.send_done = False
                     self.send_count = 0
                     self.ar_overlay_img = None
                     print(f"✅ 已鎖定手動範圍: {self.manual_bbox}，自動發送中...")
 
-            # [s] 重新發送（同一遮罩，重算抓取姿態）
+            # [s] 重新發送
             if key & 0xFF == ord('s'):
-                if best_bbox is None:
-                    print("⚠️ 目前沒有目標，請先用 [v] 或 [r] 選取")
-                elif self.sending:
+                if self.sending:
                     print("⚠️ 上一次發送尚未完成，請稍候")
                 elif self.fx is None or self.cv_depth is None:
                     print("⚠️ 相機資料尚未就緒")
-                else:
+                elif self.vlm_target and self.last_vlm_result and self.last_vlm_result.get("object_name") == self.vlm_target:
+                    print(f"🔄 沿用上一次 VLM 結果，對 [{cls_name}] 只重算 AnyGrasp 姿態...")
+                    self._trigger_reuse_vlm()
+                elif best_bbox is not None:
                     print(f"🔄 重新發送 [{cls_name}] 給 AnyGrasp 重算姿態...")
-                    self._trigger_send(best_mask, svd_mask, best_bbox, cls_name)
+                    self._trigger_send(current_mode, best_mask, best_bbox, cls_name)
+                else:
+                    print("⚠️ 目前沒有可重送的目標，請先用 [v] 或 [r] 選取")
 
             # [c] 清除 / 重置
             if key & 0xFF == ord('c'):
                 self.manual_bbox = None
                 self.vlm_target = None
-                self.brain_result = None
+                self.last_vlm_result = None
                 self.send_done = False
                 self.send_count = 0
                 self.ar_overlay_img = None
@@ -291,77 +282,95 @@ class AnyGraspROSClient:
 
         cv2.destroyAllWindows()
 
-    def _trigger_send(self, best_mask, svd_mask, bbox, name):
+    def _trigger_send(self, mode, best_mask, bbox, name):
         """拍快照並啟動背景發送 thread"""
         color_snap = self.cv_color.copy()
         depth_snap = self.cv_depth.copy()
         mask_snap = best_mask.copy() if best_mask is not None else None
-        svd_snap = svd_mask.copy() if svd_mask is not None else None
         self.sending = True
         threading.Thread(
             target=self._send_worker,
-            args=(color_snap, depth_snap, mask_snap, svd_snap, list(bbox), name),
+            args=(mode, color_snap, depth_snap, mask_snap,
+                  list(bbox) if bbox is not None else None, name),
             daemon=True
         ).start()
 
-    def _send_worker(self, color, depth_raw, best_mask, svd_mask, bbox, name):
-        """背景執行緒：SVD 去背 + ZMQ 發送"""
+    def _trigger_reuse_vlm(self):
+        """沿用上一次完整 VLM 結果，只重算 AnyGrasp 姿態"""
+        cached = self.last_vlm_result
+        if not cached:
+            print("⚠️ 尚無可重用的 VLM 結果")
+            return
+        color_snap = self.cv_color.copy()
+        depth_snap = self.cv_depth.copy()
+        self.sending = True
+        threading.Thread(
+            target=self._send_worker_reuse_vlm,
+            args=(color_snap, depth_snap, cached),
+            daemon=True
+        ).start()
+
+    def _send_worker(self, mode, color, depth_raw, best_mask, bbox, name):
+        """背景執行緒：依模式發送到遠端 server"""
         try:
-            mask_for_svd = svd_mask if svd_mask is not None else best_mask
-            if mask_for_svd is None:
-                print("🛠️ 使用 Bbox 區域發送 (無 Mask 模式)...")
-                clean_depth = depth_raw
+            if mode == "vlm":
+                print(f"🔍 直接送 VLM 請求到遠端 server：'{name}'")
+                self.process_anygrasp(color, depth_raw, None, name, None, mode="vlm")
             else:
-                label = "完整物體遮罩" if svd_mask is not None else "SAM 遮罩"
-                print(f"🎯 啟動 SVD 桌面擬合去背（{label}）...")
-                mask_resized = cv2.resize(mask_for_svd, (depth_raw.shape[1], depth_raw.shape[0]))
-                obj_mask = (mask_resized > 0.5).astype(np.uint8)
-
-                fx, fy, cx, cy = self.fx, self.fy, self.cx, self.cy
-                kernel_inner = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-                kernel_outer = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (40, 40))
-                mask_inner = cv2.dilate(obj_mask, kernel_inner, iterations=1)
-                mask_outer = cv2.dilate(obj_mask, kernel_outer, iterations=1)
-                moat_mask = cv2.subtract(mask_inner, obj_mask)
-                table_donut_mask = cv2.subtract(mask_outer, mask_inner)
-
-                v_donut, u_donut = np.where((table_donut_mask > 0) & (depth_raw > 0))
-                if len(v_donut) > 10:
-                    Z_donut = depth_raw[v_donut, u_donut].astype(np.float64)
-                    X_donut = (u_donut - cx) * Z_donut / fx
-                    Y_donut = (v_donut - cy) * Z_donut / fy
-                    points_3d = np.stack((X_donut, Y_donut, Z_donut), axis=-1)
-                    centroid = np.mean(points_3d, axis=0)
-                    centered = points_3d - centroid
-                    _, _, Vt = np.linalg.svd(centered, full_matrices=False)
-                    normal = Vt[-1]
-                    a, b, c = normal
-                    d = -np.dot(normal, centroid)
-                    v_moat, u_moat = np.where(moat_mask > 0)
-                    denom = a * (u_moat - cx) / fx + b * (v_moat - cy) / fy + c
-                    denom = np.where(denom == 0, 1e-6, denom)
-                    Z_filled = -d / denom
-                    clean_depth = depth_raw.copy()
-                    clean_depth[v_moat, u_moat] = np.clip(Z_filled, 0, 65535).astype(np.uint16)
-                else:
-                    clean_depth = depth_raw
-
-            self.process_anygrasp(color, clean_depth, bbox, name, best_mask)
+                print("🛠️ 使用 ROI 模式發送到遠端 server...")
+                self.process_anygrasp(color, depth_raw, bbox, name, best_mask, mode="roi")
         finally:
             self.sending = False
             self.send_done = True
             self.send_count += 1
 
-    def process_anygrasp(self, color, depth, bbox, name, best_mask=None):
-        print(f"\n📤 正在發送目標 [{name}] 至大腦...")
+    def _send_worker_reuse_vlm(self, color, depth_raw, cached):
+        try:
+            object_name = cached.get("object_name", self.vlm_target or "unknown")
+            print(f"♻️ 使用 cached VLM 結果重算 [{object_name}] 的 AnyGrasp 姿態...")
+            self.process_anygrasp(
+                color,
+                depth_raw,
+                cached.get("bbox"),
+                object_name,
+                cached.get("mask"),
+                mode="reuse_vlm",
+                object_shape=cached.get("object_shape"),
+                target_grids=cached.get("target_grids"),
+                reasoning=cached.get("reasoning", ""),
+                estimated_com_grid=cached.get("estimated_com_grid", "N/A"),
+                svd_mask=cached.get("svd_mask"),
+            )
+        finally:
+            self.sending = False
+            self.send_done = True
+            self.send_count += 1
+
+    def process_anygrasp(
+        self, color, depth, bbox, name, best_mask=None, mode="legacy",
+        object_shape=None, target_grids=None, reasoning="", estimated_com_grid="N/A",
+        svd_mask=None,
+    ):
+        print(f"\n📤 正在發送目標 [{name}] 至 server（mode={mode}）...")
         start_t = time.time()
         _, encoded = cv2.imencode('.jpg', color, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
         payload = {
+            'mode': mode,
+            'object_name': name,
             'color_jpg': encoded,
             'depth': depth,
-            'bbox': bbox,
             'intrinsics': {'fx': self.fx, 'fy': self.fy, 'cx': self.cx, 'cy': self.cy}
         }
+        if bbox is not None:
+            payload['bbox'] = bbox
+        if object_shape:
+            payload['object_shape'] = object_shape
+        if target_grids:
+            payload['target_grids'] = target_grids
+        if reasoning:
+            payload['reasoning'] = reasoning
+        if estimated_com_grid:
+            payload['estimated_com_grid'] = estimated_com_grid
 
         if best_mask is not None:
             mask_resized = cv2.resize(
@@ -373,6 +382,15 @@ class AnyGraspROSClient:
             if ok:
                 payload['mask'] = mask_encoded
                 print(f"🎭 已附帶 target mask，像素數: {int((mask_resized > 127).sum())}")
+        if svd_mask is not None:
+            svd_mask_resized = cv2.resize(
+                svd_mask.astype(np.uint8) * 255,
+                (depth.shape[1], depth.shape[0]),
+                interpolation=cv2.INTER_NEAREST
+            )
+            ok, svd_mask_encoded = cv2.imencode('.png', svd_mask_resized)
+            if ok:
+                payload['svd_mask'] = svd_mask_encoded
 
         compressed = zlib.compress(pickle.dumps(payload))
         try:
@@ -391,6 +409,32 @@ class AnyGraspROSClient:
 
         if result['status'] == 'success':
             print(f"🎯 獲得 6D 座標，分數: {result['score']:.4f}")
+            if result.get('target_grids'):
+                print(f"   target_grids: {result.get('target_grids')}")
+            if result.get('object_shape'):
+                print(f"   object_shape: {result.get('object_shape')}")
+            if result.get('mode') == 'vlm':
+                cached_mask = None
+                cached_svd_mask = None
+                if result.get('mask') is not None:
+                    mask_img = cv2.imdecode(result['mask'], cv2.IMREAD_GRAYSCALE)
+                    if mask_img is not None:
+                        cached_mask = (mask_img > 127).astype(np.float32)
+                if result.get('svd_mask') is not None:
+                    svd_mask_img = cv2.imdecode(result['svd_mask'], cv2.IMREAD_GRAYSCALE)
+                    if svd_mask_img is not None:
+                        cached_svd_mask = (svd_mask_img > 127).astype(np.float32)
+                self.last_vlm_result = {
+                    "object_name": name,
+                    "bbox": result.get('bbox'),
+                    "object_shape": result.get('object_shape'),
+                    "target_grids": result.get('target_grids', []),
+                    "reasoning": result.get('reasoning', ''),
+                    "estimated_com_grid": result.get('estimated_com_grid', 'N/A'),
+                    "mask": cached_mask,
+                    "svd_mask": cached_svd_mask if cached_svd_mask is not None else cached_mask,
+                }
+                print("💾 已快取本次 VLM 結果，之後可按 [s] 只重算 AnyGrasp。")
             tvec = np.array(result['translation'])
             rot_mat = np.array(result['rotation'])
             stamp = rospy.Time.now()
@@ -437,7 +481,13 @@ class AnyGraspROSClient:
         self.ar_overlay_img = drawn  # 靜態保留，直到下一次結果覆蓋
 
 if __name__ == "__main__":
-    if MOVEIT_AVAILABLE:
+    use_moveit = False
+    try:
+        rospy.init_node
+        use_moveit = bool(rospy.get_param('~use_moveit', False))
+    except Exception:
+        use_moveit = False
+    if MOVEIT_AVAILABLE and use_moveit:
         moveit_commander.roscpp_initialize(sys.argv)
     client = AnyGraspROSClient()
     client.run()

@@ -1,0 +1,11 @@
+{
+  "object_name": "can",
+  "intrinsics": {
+    "fx": 617.183,
+    "fy": 617.122,
+    "cx": 319.639,
+    "cy": 241.404
+  },
+  "depth_unit": "uint16_mm",
+  "notes": "Primary local integration sample captured from RealSense and prepared for remote AnyGrasp+VLM testing."
+}
