@@ -3,6 +3,10 @@
 
 # 🚀 UR3 × RealSense × AnyGrasp：6D 全自動語意抓取操作指南
 
+> **文件角色**：這份是正式操作手冊。
+> 若只需要現場快速檢查，請看 `note.md`；
+> 若是 repo clone / submodule 問題，請看 `docs/REPO_SETUP_AND_SUBMODULE_GUIDE.md`。
+
 > **🤖 系統架構：**
 > * **大腦 (桌機端)**：`server_anygrasp.py` — 接收影像，運算全空間 6D 抓取姿態
 > * **AI 視覺 (筆電端)**：`brain_node.py` — OWL-v2 + SAM + Gemini，語義物件分割

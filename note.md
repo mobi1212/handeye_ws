@@ -1,5 +1,8 @@
 # UR3 語義抓取系統 — 操作快速參考
 
+> 這份文件是現場速查卡。完整操作說明請看 `hackmd.md`；
+> repo / submodule 使用方式請看 `docs/REPO_SETUP_AND_SUBMODULE_GUIDE.md`。
+
 ## 啟動順序
 
 > 每個步驟等上一個就緒後再執行
@@ -43,35 +46,14 @@ rosparam load /home/weilun/handeye_ws/src/ur3_handover/config/handover_params.ya
 
 ---
 
-## 抓取流程關鍵參數
+## 參數改哪裡
 
-> 檔案：`src/ur3_handover/scripts/semantic_grasp_controller.py`
-
-| 參數 | 預設值 | 說明 |
-|------|--------|------|
-| `tcp_offset` | 0.18 m | 夾爪指尖到 MoveIt EEF 距離 |
-| `grasp_depth` | 0.05 m | 物體表面往內插入深度 |
-| `approach_dist` | 0.05 m | Pre-Grasp 退後距離 |
-| `retreat_up_height` | 0.14 m | 待機點高於放置點的高度 |
-| `final_xyz` | `[0.2401, 0.1751, 0.185]` | 固定放置座標（法蘭位置） |
-| `vel_scale` | 0.10 | 速度比例（10%） |
-| `acc_scale` | 0.10 | 加速度比例（10%） |
-
----
-
-## 抓取動作序列
-
-```
-A. 關節規劃 → Pre-Grasp（接近點）   ← [Enter] 確認 / [r] 重規劃 / [n] 取消
-B. Cartesian 直線前進 → Grasp
-C. 夾緊                              ← [Enter] 確認繼續
-D. Cartesian 垂直抬升 5 cm
-E. 關節規劃 → Pre-Place
-F. Cartesian 直線前進 → Place
-G. 張開夾爪
-H. Cartesian 後退 → Pre-Place
-   → 詢問是否回待機點
-```
+- handover 區域、掌心偏移、handedness 穩定化、力矩釋放門檻：
+  `src/ur3_handover/config/handover_params.yaml`
+- 抓取深度、approach 距離、固定放置點、速度比例：
+  `src/ur3_handover/scripts/semantic_grasp_controller.py`
+- AnyGrasp server 地址：
+  `src/ur3_handover/scripts/client_camera.py`
 
 ---
 
@@ -85,17 +67,6 @@ H. Cartesian 後退 → Pre-Place
 | ZMQ 逾時（30s） | Ngrok 斷線或 server 未啟動 | 重啟 Ngrok 並更新 client_camera.py 地址 |
 | `Object not found` | OWL-v2 偵測不到目標 | 換更精確的描述，或物件移到較亮的位置 |
 | 規劃失敗（`INVALID_GOAL`） | 軌跡時間戳過期 | 會自動重規劃，正常現象 |
-
----
-
-## RealSense D435 深度有效範圍
-
-| 距離 | 狀態 | 誤差 |
-|------|------|------|
-| 0 ~ 20 cm | 盲區，完全不可用 | — |
-| 30 ~ 60 cm | 黃金甜蜜點，適合抓取 | < 1 mm |
-| 80 ~ 100 cm | 開始飄移 | 1 ~ 2% |
-| 150 cm 以上 | 僅適合避障 | — |
 
 ---
 
@@ -118,3 +89,5 @@ print(f'xyz = [{p.position.x:.4f}, {p.position.y:.4f}, {p.position.z:.4f}]')
 # 回待機點（任何時候）
 rostopic pub /semantic_grasp/go_home std_msgs/String "go" -1
 ```
+
+需要完整 SOP、校正流程、實戰步驟、深度範圍說明時，直接看 `hackmd.md`。
